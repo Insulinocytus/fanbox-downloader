@@ -1,9 +1,15 @@
+import json
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from fanbox_dl import extract_post_files, post_directory, post_downloaded
+from fanbox_dl import (
+    extract_post_files,
+    post_directory,
+    post_downloaded,
+    read_config,
+)
 
 
 class FanboxExtractionTests(unittest.TestCase):
@@ -80,6 +86,46 @@ class FanboxExtractionTests(unittest.TestCase):
                     {"id": "12387654", "title": "测试帖子"},
                 )
             )
+
+    def test_read_config_resolves_relative_download_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            config_path = os.path.join(root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "cookie": "test-cookie",
+                        "creators": ["creator-a", "creator-b"],
+                        "download_directory": "downloads/fanbox",
+                    },
+                    fp,
+                )
+
+            config = read_config(config_path, root)
+
+            self.assertEqual(config["cookie"], "test-cookie")
+            self.assertEqual(config["creators"], ["creator-a", "creator-b"])
+            self.assertEqual(
+                config["download_directory"],
+                os.path.join(root, "downloads", "fanbox"),
+            )
+
+    def test_read_config_keeps_absolute_download_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            absolute = os.path.join(root, "absolute-downloads")
+            config_path = os.path.join(root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "cookie": "test-cookie",
+                        "creators": ["creator-a"],
+                        "download_directory": absolute,
+                    },
+                    fp,
+                )
+
+            config = read_config(config_path, root)
+
+            self.assertEqual(config["download_directory"], absolute)
 
 
 if __name__ == "__main__":

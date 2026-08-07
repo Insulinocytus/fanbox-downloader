@@ -4,12 +4,10 @@
 
 用法:
   1. 第一次:   pip install curl_cffi
-  2. 打开 fanbox_cookie.txt(空文件),把 FANBOXSESSID 的值粘到第一行(方法:
-     浏览器登录 www.fanbox.cc 后按 F12 → Application → Cookies →
-     https://www.fanbox.cc → 复制 FANBOXSESSID 那一行的值)
-  3. 在 creators.txt 里填作者名,一行一个(例如: cowmopcat)
-  4. 运行:     python fanbox_dl.py
+  2. 在 config.json 中填写 cookie、作者列表和下载目录
+  3. 运行:     python fanbox_dl.py
 """
+import json
 import os
 import re
 import sys
@@ -22,8 +20,7 @@ os.system("chcp 65001 >nul")
 sys.stdout.reconfigure(encoding="utf-8")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-COOKIE_FILE = os.path.join(BASE, "fanbox_cookie.txt")
-CREATORS_FILE = os.path.join(BASE, "creators.txt")
+CONFIG_FILE = os.path.join(BASE, "config.json")
 OUT = os.path.join(BASE, "downloads")
 
 HEADERS = {
@@ -39,21 +36,65 @@ RETRY = 5      # 被 Cloudflare 临时拦截时的重试次数
 DELAY = 1.0    # 每请求之间间隔(秒),别让 fanbox 觉得是机器人
 
 _sess = None
+_cookie_value = None
 _cookie_ok = False
 
+def read_config(path=None, base=None):
+    path = path or CONFIG_FILE
+    base = base or BASE
+    if not os.path.exists(path):
+        sys.exit(f"没找到 {path},请创建 config.json")
+
+    try:
+        with open(path, encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.exit(f"无法读取配置文件 {path}: {exc}")
+
+    if not isinstance(data, dict):
+        sys.exit("config.json 必须是 JSON 对象")
+
+    cookie = data.get("cookie", "")
+    if not isinstance(cookie, str):
+        sys.exit("config.json 的 cookie 必须是字符串")
+
+    creators = data.get("creators", [])
+    if not isinstance(creators, list):
+        sys.exit("config.json 的 creators 必须是数组")
+    creators = [creator.strip() for creator in creators
+                if isinstance(creator, str) and creator.strip()]
+
+    download_directory = data.get("download_directory", "downloads")
+    if not isinstance(download_directory, str) or not download_directory.strip():
+        download_directory = "downloads"
+    if not os.path.isabs(download_directory):
+        download_directory = os.path.join(base, download_directory)
+
+    return {
+        "cookie": cookie.strip(),
+        "creators": creators,
+        "download_directory": os.path.abspath(download_directory),
+    }
+
+def configure():
+    global _cookie_value, OUT
+    config = read_config()
+    _cookie_value = config["cookie"]
+    OUT = config["download_directory"]
+    return config["creators"]
+
 def sess():
-    global _sess, _cookie_ok
+    global _sess, _cookie_value, _cookie_ok
     if _sess is None:
+        if _cookie_value is None:
+            configure()
         _sess = requests.Session(impersonate=IMPERSONATE)
-        if os.path.exists(COOKIE_FILE):
-            ck = open(COOKIE_FILE, encoding="utf-8").read().strip()
-            if ck:
-                _sess.cookies.set("FANBOXSESSID", ck, domain=".fanbox.cc")
-                _cookie_ok = True
+        if _cookie_value:
+            _sess.cookies.set("FANBOXSESSID", _cookie_value, domain=".fanbox.cc")
+            _cookie_ok = True
         if not _cookie_ok:
-            print("注意:没读到 cookie(fanbox_cookie.txt 是空的或值不合法)。"
-                  "付费帖子只能下到封面,正文下不到。把 FANBOXSESSID 粘到该文件"
-                  "第一行后再跑。")
+            print("注意:config.json 的 cookie 为空或值不合法。"
+                  "付费帖子只能下到封面,正文下不到。")
     return _sess
 
 def api_get(url, retry=RETRY):
@@ -160,12 +201,9 @@ def sanitize(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name).strip(" .")
 
 def main():
-    if not os.path.exists(CREATORS_FILE):
-        sys.exit(f"没找到 {CREATORS_FILE},请先创建(一行一个作者名)")
-    creators = [l.strip() for l in open(CREATORS_FILE, encoding="utf-8")
-                if l.strip() and not l.strip().startswith("#")]
+    creators = configure()
     if not creators:
-        sys.exit(f"{CREATORS_FILE} 是空的,先填作者名")
+        sys.exit("config.json 的 creators 是空的,请先填作者 ID")
 
     for creator in creators:
         print(f"\n===== 作者: {creator} =====")
