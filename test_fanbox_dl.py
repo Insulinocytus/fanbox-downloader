@@ -9,6 +9,7 @@ from io import StringIO
 from unittest.mock import patch
 
 from fanbox_dl import (
+    application_base,
     extract_post_files,
     post_directory,
     post_downloaded,
@@ -18,6 +19,12 @@ from fanbox_dl import (
 
 
 class FanboxExtractionTests(unittest.TestCase):
+    def test_application_base_uses_executable_directory_when_frozen(self):
+        executable = os.path.join("D:\\Apps", "fanbox-downloader.exe")
+        with patch.object(fanbox_dl.sys, "frozen", True, create=True), \
+             patch.object(fanbox_dl.sys, "executable", executable):
+            self.assertEqual(application_base(), os.path.dirname(executable))
+
     def test_extracts_cover_html_images_and_files(self):
         post = {
             "id": "12387654",

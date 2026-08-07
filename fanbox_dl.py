@@ -21,7 +21,12 @@ from curl_cffi import requests
 os.system("chcp 65001 >nul")
 sys.stdout.reconfigure(encoding="utf-8")
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+def application_base():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE = application_base()
 CONFIG_FILE = os.path.join(BASE, "config.json")
 PROFILE_DIR = os.path.join(BASE, ".cloak-profile")
 OUT = os.path.join(BASE, "downloads")

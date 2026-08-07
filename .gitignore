@@ -3,5 +3,8 @@ fanbox_cookie.txt
 creators.txt
 downloads/
 .cloak-profile/
+build/
+dist/
+release/
 __pycache__/
 *.pyc
