@@ -2,6 +2,8 @@ import json
 import os
 import tempfile
 import unittest
+
+import fanbox_dl
 from contextlib import redirect_stdout
 from io import StringIO
 from unittest.mock import patch
@@ -135,6 +137,33 @@ class FanboxExtractionTests(unittest.TestCase):
             self.assertEqual(config["download_directory"], absolute)
             self.assertEqual(config["file_delay"], 2.0)
             self.assertEqual(config["post_delay"], 10.0)
+
+    def test_api_get_uses_browser_fetch_instead_of_curl_session(self):
+        result = {
+            "status": 200,
+            "text": '{"body":{"ok":true}}',
+        }
+        with patch.object(fanbox_dl, "browser_fetch", return_value=result), \
+             patch.object(
+                 fanbox_dl,
+                 "sess",
+                 side_effect=AssertionError("curl session must not handle API"),
+             ):
+            self.assertEqual(fanbox_dl.api_get("https://api.fanbox.cc/test"), {"ok": True})
+
+    def test_api_get_retries_browser_fetch_timeout(self):
+        with patch.object(
+            fanbox_dl,
+            "browser_fetch",
+            side_effect=[
+                {"status": 0, "text": "AbortError"},
+                {"status": 200, "text": '{"body":{"ok":true}}'},
+            ],
+        ) as fetch, patch.object(fanbox_dl.time, "sleep") as sleep:
+            self.assertEqual(fanbox_dl.api_get("https://api.fanbox.cc/test"), {"ok": True})
+
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(2)
 
     def test_cloudflare_wait_prints_progress_every_ten_seconds(self):
         output = StringIO()

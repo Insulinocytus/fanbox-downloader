@@ -2,5 +2,6 @@ config.json
 fanbox_cookie.txt
 creators.txt
 downloads/
+.cloak-profile/
 __pycache__/
 *.pyc

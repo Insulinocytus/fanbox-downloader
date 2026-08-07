@@ -7,12 +7,14 @@
   2. 在 config.json 中填写 cookie、作者列表和下载目录
   3. 运行:     python fanbox_dl.py
 """
+import atexit
 import json
 import os
 import re
 import sys
 import time
 import urllib.parse
+from cloakbrowser import launch_persistent_context
 from curl_cffi import requests
 
 # Windows 控制台中文:先切 UTF-8 再让 Python 输出 UTF-8
@@ -21,6 +23,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE, "config.json")
+PROFILE_DIR = os.path.join(BASE, ".cloak-profile")
 OUT = os.path.join(BASE, "downloads")
 
 HEADERS = {
@@ -37,8 +40,28 @@ DELAY = 1.0    # API 请求之间间隔(秒)
 FILE_DELAY = 2.0
 POST_DELAY = 10.0
 CLOUDFLARE_WAITS = (30, 60, 120, 300)
+BROWSER_FETCH_SCRIPT = """
+async ({url}) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    try {
+        const response = await fetch(url, {
+            credentials: "include",
+            headers: {"Accept": "application/json, text/plain, */*"},
+            signal: controller.signal
+        });
+        return {status: response.status, text: await response.text()};
+    } catch (error) {
+        return {status: 0, text: String(error)};
+    } finally {
+        clearTimeout(timer);
+    }
+}
+"""
 
 _sess = None
+_browser_context = None
+_browser_page = None
 _cookie_value = None
 _cookie_ok = False
 
@@ -113,6 +136,47 @@ def sess():
                   "付费帖子只能下到封面,正文下不到。")
     return _sess
 
+def browser_fetch(url):
+    global _browser_context, _browser_page
+    if _browser_page is None:
+        if _cookie_value is None:
+            configure()
+        print("正在启动 CloakBrowser...", flush=True)
+        _browser_context = launch_persistent_context(
+            PROFILE_DIR,
+            headless=False,
+            humanize=True,
+        )
+        if _cookie_value:
+            _browser_context.add_cookies([{
+                "name": "FANBOXSESSID",
+                "value": _cookie_value,
+                "domain": ".fanbox.cc",
+                "path": "/",
+                "secure": True,
+                "httpOnly": True,
+            }])
+        _browser_page = (_browser_context.pages[0] if _browser_context.pages
+                         else _browser_context.new_page())
+        _browser_page.goto(
+            "https://www.fanbox.cc/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        print("CloakBrowser 已登录 Fanbox，开始后台 API 请求。", flush=True)
+    return _browser_page.evaluate(BROWSER_FETCH_SCRIPT, {"url": url})
+
+def close_browser():
+    global _browser_context, _browser_page
+    if _browser_context is not None:
+        try:
+            _browser_context.close()
+        except Exception:
+            pass
+        _browser_context = _browser_page = None
+
+atexit.register(close_browser)
+
 def wait_with_progress(seconds):
     remaining = int(seconds)
     while remaining > 0:
@@ -126,15 +190,29 @@ def api_get(url, retry=RETRY):
         if attempt > 1:
             print(f"  冷却结束,正在发起第 {attempt}/{retry} 次请求...", flush=True)
         try:
-            r = sess().get(url, headers=HEADERS, timeout=30)
-        except requests.RequestsError as e:
+            result = browser_fetch(url)
+        except Exception as exc:
             if attempt < retry:
                 wait = 2 ** attempt
-                print(f"  网络错误,{wait}s 后重试({attempt}/{retry})", flush=True)
+                print(f"  浏览器请求错误({exc}),{wait}s 后重试({attempt}/{retry})",
+                      flush=True)
                 time.sleep(wait)
                 continue
             raise
-        if r.status_code == 403 and "block_ip" in r.text:
+
+        status = result.get("status", 0)
+        response_text = result.get("text", "")
+        if status == 0:
+            if attempt < retry:
+                wait = 2 ** attempt
+                print(f"  浏览器请求超时,{wait}s 后重试({attempt}/{retry})",
+                      flush=True)
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"浏览器请求失败: {response_text}")
+        if status == 403 and (
+                "block_ip" in response_text or
+                "challenge" in response_text.lower()):
             if attempt < retry:
                 wait = CLOUDFLARE_WAITS[min(attempt - 1, len(CLOUDFLARE_WAITS) - 1)]
                 print(f"  Cloudflare 临时拦截,{wait}s 后重试(下一次 {attempt + 1}/{retry})",
@@ -145,10 +223,14 @@ def api_get(url, retry=RETRY):
                 f"被 Cloudflare 拦截,重试 {retry - 1} 次仍失败。"
                 "已安全停止,稍后重新运行即可从断点继续。"
             )
-        if r.status_code == 401 or (r.status_code == 403 and "body" not in r.text):
-            sys.exit("登录失效(cookie 无效/过期)。请重新复制 FANBOXSESSID 到 fanbox_cookie.txt")
-        r.raise_for_status()
-        return r.json()["body"]
+        if status in (401, 403):
+            sys.exit("登录失效(cookie 无效/过期)。请更新 config.json 的 cookie")
+        if status != 200:
+            raise RuntimeError(f"Fanbox API 返回 HTTP {status}: {response_text[:200]}")
+        try:
+            return json.loads(response_text)["body"]
+        except (json.JSONDecodeError, KeyError) as exc:
+            raise RuntimeError("Fanbox API 返回内容不是有效 JSON") from exc
     raise RuntimeError("unreachable")
 
 def post_urls(creator):
