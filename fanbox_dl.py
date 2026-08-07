@@ -141,6 +141,10 @@ def post_directory(creator, post_id, title):
     title = sanitize(str(title)) or post_id
     return os.path.join(OUT, creator, f"{post_id}-{title}")
 
+def post_downloaded(creator, post):
+    title = post.get("title") or post["id"]
+    return os.path.isdir(post_directory(creator, post["id"], title))
+
 def dl(url, path):
     if os.path.exists(path):
         return False
@@ -180,6 +184,9 @@ def main():
                 continue
             for p in posts:
                 pid = p["id"]
+                if post_downloaded(creator, p):
+                    print(f"  帖子 {pid} 已存在,跳过")
+                    continue
                 print(f"  帖子 {pid} ...", end=" ", flush=True)
                 try:
                     title, files = post_files(pid)

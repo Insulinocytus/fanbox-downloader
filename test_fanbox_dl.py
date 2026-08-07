@@ -1,7 +1,9 @@
 import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from fanbox_dl import extract_post_files, post_directory
+from fanbox_dl import extract_post_files, post_directory, post_downloaded
 
 
 class FanboxExtractionTests(unittest.TestCase):
@@ -66,6 +68,18 @@ class FanboxExtractionTests(unittest.TestCase):
                 )
             ),
         )
+
+    def test_existing_post_directory_is_detected(self):
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root):
+            path = post_directory("creator", "12387654", "测试帖子")
+            os.makedirs(path)
+
+            self.assertTrue(
+                post_downloaded(
+                    "creator",
+                    {"id": "12387654", "title": "测试帖子"},
+                )
+            )
 
 
 if __name__ == "__main__":
