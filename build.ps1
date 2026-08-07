@@ -9,7 +9,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $package = Join-Path $PSScriptRoot "dist\fanbox-downloader"
 Copy-Item "config.example.json" (Join-Path $package "config.json") -Force
-Copy-Item "README-ZH.txt" $package -Force
+Copy-Item "README.md" $package -Force
 
 $release = Join-Path $PSScriptRoot "release"
 New-Item -ItemType Directory -Force $release | Out-Null

@@ -42,8 +42,8 @@ HEADERS = {
 IMPERSONATE = "chrome"  # 浏览器指纹,fanbox 的 Cloudflare 只放行真浏览器
 RETRY = 5      # 初次请求 + 4 次 Cloudflare 重试
 DELAY = 1.0    # API 请求之间间隔(秒)
-FILE_DELAY = 2.0
-POST_DELAY = 10.0
+FILE_DELAY = 0.0
+POST_DELAY = 5.0
 CLOUDFLARE_WAITS = (30, 60, 120, 300)
 BROWSER_FETCH_SCRIPT = """
 async ({url}) => {
@@ -114,8 +114,8 @@ def read_config(path=None, base=None):
         "cookie": cookie.strip(),
         "creators": creators,
         "download_directory": os.path.abspath(download_directory),
-        "file_delay": read_delay("file_delay", 2.0),
-        "post_delay": read_delay("post_delay", 10.0),
+        "file_delay": read_delay("file_delay", 0.0),
+        "post_delay": read_delay("post_delay", 5.0),
     }
 
 def configure():

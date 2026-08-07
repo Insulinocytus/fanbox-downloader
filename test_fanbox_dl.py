@@ -142,8 +142,8 @@ class FanboxExtractionTests(unittest.TestCase):
             config = read_config(config_path, root)
 
             self.assertEqual(config["download_directory"], absolute)
-            self.assertEqual(config["file_delay"], 2.0)
-            self.assertEqual(config["post_delay"], 10.0)
+            self.assertEqual(config["file_delay"], 0.0)
+            self.assertEqual(config["post_delay"], 5.0)
 
     def test_api_get_uses_browser_fetch_instead_of_curl_session(self):
         result = {
