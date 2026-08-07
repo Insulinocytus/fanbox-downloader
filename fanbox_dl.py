@@ -113,8 +113,18 @@ def sess():
                   "付费帖子只能下到封面,正文下不到。")
     return _sess
 
+def wait_with_progress(seconds):
+    remaining = int(seconds)
+    while remaining > 0:
+        print(f"  Cloudflare 冷却中,剩余约 {remaining} 秒", flush=True)
+        wait = min(10, remaining)
+        time.sleep(wait)
+        remaining -= wait
+
 def api_get(url, retry=RETRY):
     for attempt in range(1, retry + 1):
+        if attempt > 1:
+            print(f"  冷却结束,正在发起第 {attempt}/{retry} 次请求...", flush=True)
         try:
             r = sess().get(url, headers=HEADERS, timeout=30)
         except requests.RequestsError as e:
@@ -127,9 +137,9 @@ def api_get(url, retry=RETRY):
         if r.status_code == 403 and "block_ip" in r.text:
             if attempt < retry:
                 wait = CLOUDFLARE_WAITS[min(attempt - 1, len(CLOUDFLARE_WAITS) - 1)]
-                print(f"  Cloudflare 临时拦截,{wait}s 后重试({attempt}/{retry - 1})",
+                print(f"  Cloudflare 临时拦截,{wait}s 后重试(下一次 {attempt + 1}/{retry})",
                       flush=True)
-                time.sleep(wait)
+                wait_with_progress(wait)
                 continue
             raise CloudflareBlocked(
                 f"被 Cloudflare 拦截,重试 {retry - 1} 次仍失败。"

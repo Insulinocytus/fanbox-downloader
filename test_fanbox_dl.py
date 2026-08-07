@@ -2,6 +2,8 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 from fanbox_dl import (
@@ -9,6 +11,7 @@ from fanbox_dl import (
     post_directory,
     post_downloaded,
     read_config,
+    wait_with_progress,
 )
 
 
@@ -132,6 +135,23 @@ class FanboxExtractionTests(unittest.TestCase):
             self.assertEqual(config["download_directory"], absolute)
             self.assertEqual(config["file_delay"], 2.0)
             self.assertEqual(config["post_delay"], 10.0)
+
+    def test_cloudflare_wait_prints_progress_every_ten_seconds(self):
+        output = StringIO()
+        waits = []
+        with patch("fanbox_dl.time.sleep", side_effect=waits.append):
+            with redirect_stdout(output):
+                wait_with_progress(25)
+
+        self.assertEqual(waits, [10, 10, 5])
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "  Cloudflare 冷却中,剩余约 25 秒",
+                "  Cloudflare 冷却中,剩余约 15 秒",
+                "  Cloudflare 冷却中,剩余约 5 秒",
+            ],
+        )
 
 
 if __name__ == "__main__":
