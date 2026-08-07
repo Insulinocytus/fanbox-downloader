@@ -96,6 +96,8 @@ class FanboxExtractionTests(unittest.TestCase):
                         "cookie": "test-cookie",
                         "creators": ["creator-a", "creator-b"],
                         "download_directory": "downloads/fanbox",
+                        "file_delay": 2.5,
+                        "post_delay": 12,
                     },
                     fp,
                 )
@@ -108,6 +110,8 @@ class FanboxExtractionTests(unittest.TestCase):
                 config["download_directory"],
                 os.path.join(root, "downloads", "fanbox"),
             )
+            self.assertEqual(config["file_delay"], 2.5)
+            self.assertEqual(config["post_delay"], 12.0)
 
     def test_read_config_keeps_absolute_download_directory(self):
         with tempfile.TemporaryDirectory() as root:
@@ -126,6 +130,8 @@ class FanboxExtractionTests(unittest.TestCase):
             config = read_config(config_path, root)
 
             self.assertEqual(config["download_directory"], absolute)
+            self.assertEqual(config["file_delay"], 2.0)
+            self.assertEqual(config["post_delay"], 10.0)
 
 
 if __name__ == "__main__":

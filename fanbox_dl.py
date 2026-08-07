@@ -32,12 +32,18 @@ HEADERS = {
     "Sec-Fetch-Site": "same-site",
 }
 IMPERSONATE = "chrome"  # 浏览器指纹,fanbox 的 Cloudflare 只放行真浏览器
-RETRY = 5      # 被 Cloudflare 临时拦截时的重试次数
-DELAY = 1.0    # 每请求之间间隔(秒),别让 fanbox 觉得是机器人
+RETRY = 5      # 初次请求 + 4 次 Cloudflare 重试
+DELAY = 1.0    # API 请求之间间隔(秒)
+FILE_DELAY = 2.0
+POST_DELAY = 10.0
+CLOUDFLARE_WAITS = (30, 60, 120, 300)
 
 _sess = None
 _cookie_value = None
 _cookie_ok = False
+
+class CloudflareBlocked(RuntimeError):
+    pass
 
 def read_config(path=None, base=None):
     path = path or CONFIG_FILE
@@ -70,17 +76,27 @@ def read_config(path=None, base=None):
     if not os.path.isabs(download_directory):
         download_directory = os.path.join(base, download_directory)
 
+    def read_delay(name, default):
+        value = data.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            sys.exit(f"config.json 的 {name} 必须是非负数字")
+        return float(value)
+
     return {
         "cookie": cookie.strip(),
         "creators": creators,
         "download_directory": os.path.abspath(download_directory),
+        "file_delay": read_delay("file_delay", 2.0),
+        "post_delay": read_delay("post_delay", 10.0),
     }
 
 def configure():
-    global _cookie_value, OUT
+    global _cookie_value, OUT, FILE_DELAY, POST_DELAY
     config = read_config()
     _cookie_value = config["cookie"]
     OUT = config["download_directory"]
+    FILE_DELAY = config["file_delay"]
+    POST_DELAY = config["post_delay"]
     return config["creators"]
 
 def sess():
@@ -110,12 +126,15 @@ def api_get(url, retry=RETRY):
             raise
         if r.status_code == 403 and "block_ip" in r.text:
             if attempt < retry:
-                wait = 2 ** attempt
-                print(f"  Cloudflare 临时拦截,{wait}s 后重试({attempt}/{retry})",
+                wait = CLOUDFLARE_WAITS[min(attempt - 1, len(CLOUDFLARE_WAITS) - 1)]
+                print(f"  Cloudflare 临时拦截,{wait}s 后重试({attempt}/{retry - 1})",
                       flush=True)
                 time.sleep(wait)
                 continue
-            sys.exit("被 Cloudflare 拦截,重试 {RETRY} 次仍失败。等一会或换个 IP/网络再试。")
+            raise CloudflareBlocked(
+                f"被 Cloudflare 拦截,重试 {retry - 1} 次仍失败。"
+                "已安全停止,稍后重新运行即可从断点继续。"
+            )
         if r.status_code == 401 or (r.status_code == 403 and "body" not in r.text):
             sys.exit("登录失效(cookie 无效/过期)。请重新复制 FANBOXSESSID 到 fanbox_cookie.txt")
         r.raise_for_status()
@@ -190,6 +209,8 @@ def dl(url, path):
     if os.path.exists(path):
         return False
     r = sess().get(url, impersonate=IMPERSONATE, stream=True, timeout=60)
+    if r.status_code == 403 and "block_ip" in r.text:
+        raise CloudflareBlocked("下载文件时被 Cloudflare 拦截")
     r.raise_for_status()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fp:
@@ -217,6 +238,10 @@ def main():
         for ui, u in enumerate(urls, 1):
             try:
                 posts = api_get(u).get("posts", [])
+                time.sleep(DELAY)
+            except CloudflareBlocked as e:
+                print(f"  {e}")
+                return
             except Exception as e:
                 print(f"  第 {ui}/{len(urls)} 页失败: {e}")
                 continue
@@ -228,28 +253,35 @@ def main():
                 print(f"  帖子 {pid} ...", end=" ", flush=True)
                 try:
                     title, files = post_files(pid)
+                    if not files:
+                        print("无文件,跳过")
+                        continue
+                    post_dir = post_directory(creator, pid, title)
+                    n = 0
+                    for url, name in files:
+                        ext = (os.path.splitext(name)[1] if name
+                               else os.path.splitext(url.split("?")[0])[1] or ".bin")
+                        fname = f"{pid}_{n}{ext}"
+                        if name:
+                            fname = f"{pid}_{n}_{sanitize(name)}"
+                        path = os.path.join(post_dir, fname)
+                        try:
+                            if dl(url, path):
+                                total_new += 1
+                            n += 1
+                        except CloudflareBlocked:
+                            raise
+                        except Exception as e:
+                            print(f"\n  下载 {url} 失败: {e}")
+                        time.sleep(FILE_DELAY)
+                    print(f"完成({n} 个文件) -> {post_dir}")
+                except CloudflareBlocked as e:
+                    print(f"\n  {e}")
+                    return
                 except Exception as e:
                     print(f"失败: {e}")
-                    continue
-                if not files:
-                    print("无文件,跳过")
-                    continue
-                post_dir = post_directory(creator, pid, title)
-                n = 0
-                for url, name in files:
-                    ext = (os.path.splitext(name)[1] if name
-                           else os.path.splitext(url.split("?")[0])[1] or ".bin")
-                    fname = f"{pid}_{n}{ext}"
-                    if name:
-                        fname = f"{pid}_{n}_{sanitize(name)}"
-                    path = os.path.join(post_dir, fname)
-                    try:
-                        if dl(url, path):
-                            total_new += 1
-                        n += 1
-                    except Exception as e:
-                        print(f"\n  下载 {url} 失败: {e}")
-                print(f"完成({n} 个文件) -> {post_dir}")
+                finally:
+                    time.sleep(POST_DELAY)
         print(f"  >> 本作者新增 {total_new} 个文件 -> {os.path.join(OUT, creator)}")
 
     print("\n全部完成。")
