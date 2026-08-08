@@ -11,7 +11,9 @@ downloads/
 .cloak-profile/
 data/
 
-# Python caches and local tooling
+# Python environments, caches and local tooling
+.venv/
+.uv/
 __pycache__/
 *.py[cod]
 .pytest_cache/

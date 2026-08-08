@@ -10,7 +10,18 @@
 docker build -t fanbox-downloader .
 ```
 
-镜像会在构建阶段安装 CloakBrowser 和 Linux 浏览器依赖，容器首次启动时不需要再下载浏览器。
+镜像会在构建阶段使用 `uv.lock` 安装依赖，并安装 CloakBrowser 和 Linux 浏览器依赖；容器首次启动时不需要再下载浏览器。
+
+## 本地开发
+
+安装 [uv](https://docs.astral.sh/uv/getting-started/installation/) 后，在项目根目录执行：
+
+```bash
+uv sync --locked
+uv run python -m unittest discover -v
+```
+
+依赖声明位于 `pyproject.toml`，锁文件为 `uv.lock`。依赖变更后使用 `uv lock` 更新锁文件，再用 `uv sync --locked` 验证。
 
 ## 配置环境变量
 
