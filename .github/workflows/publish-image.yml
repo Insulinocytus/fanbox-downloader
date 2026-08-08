@@ -64,24 +64,22 @@ jobs:
             uid="$1"
             gid="$2"
             root="$RUNNER_TEMP/puid-pgid-$uid-$gid"
-            mkdir -p "$root/downloads" "$root/profile"
+            mkdir -p "$root/downloads"
             docker run --rm \
               -e FANBOX_COOKIE=test \
               -e FANBOX_CREATORS=test \
               -e PUID="$uid" \
               -e PGID="$gid" \
               -v "$root/downloads:/data/downloads" \
-              -v "$root/profile:/data/.cloak-profile" \
               "$IMAGE" \
-              python -c 'import os; assert (os.getuid(), os.getgid()) == (int(os.environ["PUID"]), int(os.environ["PGID"])); open("/data/downloads/.uid-check", "w").close(); open("/data/.cloak-profile/.gid-check", "w").close()'
+              python -c 'import os; assert (os.getuid(), os.getgid()) == (int(os.environ["PUID"]), int(os.environ["PGID"])); open("/data/downloads/.uid-check", "w").close()'
             test "$(stat -c %u "$root/downloads/.uid-check")" = "$uid"
             test "$(stat -c %g "$root/downloads/.uid-check")" = "$gid"
-            test "$(stat -c %u "$root/profile/.gid-check")" = "$uid"
-            test "$(stat -c %g "$root/profile/.gid-check")" = "$gid"
           }
 
           run_identity_check 10001 10001
           run_identity_check 3000 3000
+          run_identity_check 3000 3001
 
           if docker run --rm -e PUID=0 -e PGID=3000 "$IMAGE" true; then
             echo "PUID=0 unexpectedly succeeded" >&2

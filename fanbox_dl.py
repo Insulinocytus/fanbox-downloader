@@ -11,11 +11,10 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from cloakbrowser import launch_persistent_context
+from cloakbrowser import launch_context
 from croniter import croniter
 from curl_cffi import requests
 
-PROFILE_DIR = "/data/.cloak-profile"
 OUT = "/data/downloads"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_CRON = "0 */6 * * *"
@@ -141,8 +140,7 @@ def browser_fetch(url):
         if _cookie_value is None:
             configure()
         print("正在启动 CloakBrowser...", flush=True)
-        _browser_context = launch_persistent_context(
-            PROFILE_DIR,
+        _browser_context = launch_context(
             headless=True,
             humanize=True,
         )

@@ -50,12 +50,12 @@ COPY fanbox_dl.py .
 
 RUN groupadd --gid 10001 appgroup \
     && useradd --create-home --uid 10001 --gid appgroup appuser \
-    && mkdir -p /data/downloads /data/.cloak-profile \
+    && mkdir -p /data/downloads \
     && chown -R appuser:appgroup /app /data /opt/cloakbrowser-cache
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 
-VOLUME ["/data/downloads", "/data/.cloak-profile"]
+VOLUME ["/data/downloads"]
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "fanbox_dl.py"]

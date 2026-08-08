@@ -136,7 +136,7 @@ class BrowserLifecycleTests(unittest.TestCase):
         fanbox_dl._browser_context = None
         fanbox_dl._browser_page = None
 
-    def test_browser_fetch_uses_headless_context(self):
+    def test_browser_fetch_uses_ephemeral_headless_context(self):
         class FakePage:
             def goto(self, *_args, **_kwargs):
                 pass
@@ -154,18 +154,26 @@ class BrowserLifecycleTests(unittest.TestCase):
                 self.page = FakePage()
                 return self.page
 
+            def close(self):
+                self.closed = True
+
         context = FakeContext()
-        with patch.object(fanbox_dl, "launch_persistent_context", return_value=context) as launch, \
+        with patch.object(fanbox_dl, "launch_context", return_value=context) as launch, \
              patch.object(fanbox_dl, "_cookie_value", "cookie"), \
              redirect_stdout(StringIO()):
             result = fanbox_dl.browser_fetch("https://api.fanbox.cc/test")
 
         launch.assert_called_once_with(
-            fanbox_dl.PROFILE_DIR,
             headless=True,
             humanize=True,
         )
+        self.assertEqual(context.cookies[0]["value"], "cookie")
         self.assertEqual(result["status"], 200)
+
+        fanbox_dl.close_browser()
+        self.assertTrue(context.closed)
+        self.assertIsNone(fanbox_dl._browser_context)
+        self.assertIsNone(fanbox_dl._browser_page)
 
     def test_run_once_closes_browser_after_failure(self):
         with patch.object(fanbox_dl, "post_urls", side_effect=RuntimeError("failed")), \

@@ -2,7 +2,7 @@
 
 这是一个运行在 Docker 中的 Fanbox 下载服务，用于下载已订阅作者的帖子封面、正文图片和附件。
 
-容器会常驻运行，并按照 cron 计划自动执行下载。每轮任务结束后浏览器会关闭，但浏览器 profile 和下载文件会通过 volume 保留。
+容器会常驻运行，并按照 cron 计划自动执行下载。每轮任务结束后浏览器都会关闭；下载文件通过 volume 保留，浏览器 profile 不持久化。
 
 ## 构建镜像
 
@@ -79,28 +79,25 @@ https://作者ID.fanbox.cc/
 
 ```bash
 docker volume create fanbox-downloads
-docker volume create fanbox-profile
 
 docker run -d \
   --name fanbox-downloader \
   --restart unless-stopped \
   --env-file .env \
   -v fanbox-downloads:/data/downloads \
-  -v fanbox-profile:/data/.cloak-profile \
   fanbox-downloader
 ```
 
 也可以使用宿主机目录：
 
 ```bash
-mkdir -p downloads .cloak-profile
+mkdir -p downloads
 
 docker run -d \
   --name fanbox-downloader \
   --restart unless-stopped \
   --env-file .env \
   -v "$PWD/downloads:/data/downloads" \
-  -v "$PWD/.cloak-profile:/data/.cloak-profile" \
   fanbox-downloader
 ```
 
@@ -124,13 +121,12 @@ services:
       FANBOX_RUN_ON_START: "false"
     volumes:
       - ./data/downloads:/data/downloads
-      - ./data/cloak-profile:/data/.cloak-profile
 ```
 
 使用 `PUID`/`PGID` 时不要同时设置 `user:`。启动前创建宿主机目录：
 
 ```bash
-mkdir -p data/downloads data/cloak-profile
+mkdir -p data/downloads
 docker compose up -d
 ```
 
@@ -153,6 +149,8 @@ docker logs -f fanbox-downloader
 
 ## 数据目录
 
+只有下载目录需要持久化：
+
 ```text
 /data/downloads/
 └── 作者ID/
@@ -160,9 +158,8 @@ docker logs -f fanbox-downloader
         ├── 帖子ID_0.jpeg
         ├── 帖子ID_1.png
         └── ...
-
-/data/.cloak-profile/
-└── CloakBrowser 持久化 profile
 ```
+
+浏览器每轮使用临时 profile，不需要挂载或保存 `.cloak-profile`。升级前如需保留旧版本回滚能力，可以暂时保留旧 profile volume；新版本不会读取它。
 
 已存在的帖子文件夹会被跳过。如果帖子下载不完整，请删除对应帖子文件夹后再执行。

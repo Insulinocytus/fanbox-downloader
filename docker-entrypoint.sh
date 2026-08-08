@@ -38,7 +38,16 @@ if [ "$(id -u appuser)" -ne "$PUID" ]; then
     usermod --uid "$PUID" appuser || die "could not set appuser to PUID $PUID"
 fi
 
-chown -R appuser:appgroup /data /opt/cloakbrowser-cache /home/appuser \
+if [ "$(id -g appuser)" -ne "$PGID" ]; then
+    usermod --gid "$PGID" appuser || die "could not set appuser to PGID $PGID"
+fi
+
+[ "$(id -u appuser)" -eq "$PUID" ] \
+    || die "appuser UID does not match PUID"
+[ "$(id -g appuser)" -eq "$PGID" ] \
+    || die "appuser GID does not match PGID"
+
+chown -R appuser:appgroup /data/downloads /opt/cloakbrowser-cache /home/appuser \
     || die "could not initialize writable directory ownership"
 
 export HOME=/home/appuser
