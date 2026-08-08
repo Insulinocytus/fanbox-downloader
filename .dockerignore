@@ -1,0 +1,15 @@
+.git
+.pi
+.cloak-profile
+downloads
+build
+dist
+release
+__pycache__
+*.pyc
+*.pyo
+*.log
+config.json
+config.example.json
+fanbox-downloader.spec
+build.ps1

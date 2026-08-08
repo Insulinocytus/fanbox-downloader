@@ -1,10 +1,28 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
 config.json
 fanbox_cookie.txt
 creators.txt
+
+# Runtime data
 downloads/
 .cloak-profile/
+data/
+
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build and release artifacts
 build/
 dist/
 release/
-__pycache__/
-*.pyc
+*.zip
+
+# Logs
+*.log

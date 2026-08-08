@@ -1,30 +1,182 @@
-import json
 import os
 import tempfile
 import unittest
-
-import fanbox_dl
 from contextlib import redirect_stdout
+from datetime import datetime
 from io import StringIO
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
+
+import fanbox_dl
 
 from fanbox_dl import (
-    application_base,
     extract_post_files,
+    next_scheduled_time,
     post_directory,
     post_downloaded,
     read_config,
+    run_scheduler,
     wait_with_progress,
 )
 
 
-class FanboxExtractionTests(unittest.TestCase):
-    def test_application_base_uses_executable_directory_when_frozen(self):
-        executable = os.path.join("D:\\Apps", "fanbox-downloader.exe")
-        with patch.object(fanbox_dl.sys, "frozen", True, create=True), \
-             patch.object(fanbox_dl.sys, "executable", executable):
-            self.assertEqual(application_base(), os.path.dirname(executable))
+class ConfigurationTests(unittest.TestCase):
+    def test_requires_cookie(self):
+        with self.assertRaises(SystemExit) as error:
+            read_config({"FANBOX_CREATORS": "creator"})
 
+        self.assertIn("FANBOX_COOKIE", str(error.exception))
+
+    def test_reads_environment_defaults(self):
+        config = read_config({
+            "FANBOX_COOKIE": "test-cookie",
+            "FANBOX_CREATORS": " creator-a, creator-b ,, ",
+        })
+
+        self.assertEqual(config["cookie"], "test-cookie")
+        self.assertEqual(config["creators"], ["creator-a", "creator-b"])
+        self.assertEqual(config["download_directory"], "/data/downloads")
+        self.assertEqual(config["file_delay"], 0.0)
+        self.assertEqual(config["post_delay"], 10.0)
+        self.assertEqual(config["timezone"].key, "Asia/Shanghai")
+        self.assertEqual(config["cron"], "0 */6 * * *")
+        self.assertFalse(config["run_on_start"])
+
+    def test_rejects_invalid_environment_values(self):
+        cases = [
+            ({"FANBOX_COOKIE": "", "FANBOX_CREATORS": "creator"}, "FANBOX_COOKIE"),
+            ({"FANBOX_COOKIE": "cookie", "FANBOX_CREATORS": ""}, "FANBOX_CREATORS"),
+            ({"FANBOX_COOKIE": "cookie", "FANBOX_CREATORS": "creator", "FANBOX_FILE_DELAY": "-1"}, "FANBOX_FILE_DELAY"),
+            ({"FANBOX_COOKIE": "cookie", "FANBOX_CREATORS": "creator", "FANBOX_TIMEZONE": "invalid/zone"}, "FANBOX_TIMEZONE"),
+            ({"FANBOX_COOKIE": "cookie", "FANBOX_CREATORS": "creator", "FANBOX_CRON": "not cron"}, "FANBOX_CRON"),
+            ({"FANBOX_COOKIE": "cookie", "FANBOX_CREATORS": "creator", "FANBOX_RUN_ON_START": "maybe"}, "FANBOX_RUN_ON_START"),
+        ]
+
+        for environment, name in cases:
+            with self.subTest(name=name), self.assertRaises(SystemExit) as error:
+                read_config(environment)
+            self.assertIn(name, str(error.exception))
+
+
+class SchedulerTests(unittest.TestCase):
+    def setUp(self):
+        fanbox_dl._shutdown_requested = False
+
+    def tearDown(self):
+        fanbox_dl._shutdown_requested = False
+
+    def test_next_cron_time_uses_configured_timezone(self):
+        now = datetime(2024, 1, 1, 0, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        result = next_scheduled_time("0 * * * *", ZoneInfo("Asia/Shanghai"), now)
+
+        self.assertEqual(result, datetime(2024, 1, 1, 1, 0, tzinfo=ZoneInfo("Asia/Shanghai")))
+
+    def test_next_cron_time_after_long_run_skips_elapsed_occurrence(self):
+        finished = datetime(2024, 1, 1, 1, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        result = next_scheduled_time("0 * * * *", ZoneInfo("Asia/Shanghai"), finished)
+
+        self.assertEqual(result.hour, 2)
+        self.assertEqual(result.minute, 0)
+
+    def test_startup_run_true_runs_before_waiting(self):
+        calls = []
+        config = read_config({
+            "FANBOX_COOKIE": "cookie",
+            "FANBOX_CREATORS": "creator",
+            "FANBOX_RUN_ON_START": "true",
+        })
+
+        def run_once(creators):
+            calls.append(creators)
+            fanbox_dl._shutdown_requested = True
+
+        run_scheduler(config, run_once_fn=run_once, sleep_fn=lambda _: self.fail("should not wait"))
+
+        self.assertEqual(calls, [["creator"]])
+
+    def test_startup_run_false_waits_for_schedule(self):
+        calls = []
+        waits = []
+        config = read_config({
+            "FANBOX_COOKIE": "cookie",
+            "FANBOX_CREATORS": "creator",
+            "FANBOX_CRON": "0 * * * *",
+            "FANBOX_RUN_ON_START": "false",
+        })
+
+        def run_once(creators):
+            calls.append(creators)
+            fanbox_dl._shutdown_requested = True
+
+        times = iter([
+            datetime(2024, 1, 1, 0, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+            datetime(2024, 1, 1, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+            datetime(2024, 1, 1, 1, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        ])
+        with redirect_stdout(StringIO()):
+            run_scheduler(
+                config,
+                run_once_fn=run_once,
+                now_fn=lambda: next(times),
+                sleep_fn=waits.append,
+            )
+
+        self.assertEqual(calls, [["creator"]])
+        self.assertEqual(len(waits), 1)
+
+
+class BrowserLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        fanbox_dl._browser_context = None
+        fanbox_dl._browser_page = None
+
+    def tearDown(self):
+        fanbox_dl._browser_context = None
+        fanbox_dl._browser_page = None
+
+    def test_browser_fetch_uses_headless_context(self):
+        class FakePage:
+            def goto(self, *_args, **_kwargs):
+                pass
+
+            def evaluate(self, *_args, **_kwargs):
+                return {"status": 200, "text": '{"body":{}}'}
+
+        class FakeContext:
+            pages = []
+
+            def add_cookies(self, cookies):
+                self.cookies = cookies
+
+            def new_page(self):
+                self.page = FakePage()
+                return self.page
+
+        context = FakeContext()
+        with patch.object(fanbox_dl, "launch_persistent_context", return_value=context) as launch, \
+             patch.object(fanbox_dl, "_cookie_value", "cookie"), \
+             redirect_stdout(StringIO()):
+            result = fanbox_dl.browser_fetch("https://api.fanbox.cc/test")
+
+        launch.assert_called_once_with(
+            fanbox_dl.PROFILE_DIR,
+            headless=True,
+            humanize=True,
+        )
+        self.assertEqual(result["status"], 200)
+
+    def test_run_once_closes_browser_after_failure(self):
+        with patch.object(fanbox_dl, "post_urls", side_effect=RuntimeError("failed")), \
+             patch.object(fanbox_dl, "close_browser") as close, \
+             redirect_stdout(StringIO()):
+            fanbox_dl.run_once(["creator"])
+
+        close.assert_called_once_with()
+
+
+class FanboxExtractionTests(unittest.TestCase):
     def test_extracts_cover_html_images_and_files(self):
         post = {
             "id": "12387654",
@@ -78,12 +230,7 @@ class FanboxExtractionTests(unittest.TestCase):
         self.assertEqual(
             os.path.normpath(path),
             os.path.normpath(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    "downloads",
-                    "creator",
-                    "12387654-标题__测试",
-                )
+                os.path.join("/data/downloads", "creator", "12387654-标题__测试")
             ),
         )
 
@@ -98,52 +245,6 @@ class FanboxExtractionTests(unittest.TestCase):
                     {"id": "12387654", "title": "测试帖子"},
                 )
             )
-
-    def test_read_config_resolves_relative_download_directory(self):
-        with tempfile.TemporaryDirectory() as root:
-            config_path = os.path.join(root, "config.json")
-            with open(config_path, "w", encoding="utf-8") as fp:
-                json.dump(
-                    {
-                        "cookie": "test-cookie",
-                        "creators": ["creator-a", "creator-b"],
-                        "download_directory": "downloads/fanbox",
-                        "file_delay": 2.5,
-                        "post_delay": 12,
-                    },
-                    fp,
-                )
-
-            config = read_config(config_path, root)
-
-            self.assertEqual(config["cookie"], "test-cookie")
-            self.assertEqual(config["creators"], ["creator-a", "creator-b"])
-            self.assertEqual(
-                config["download_directory"],
-                os.path.join(root, "downloads", "fanbox"),
-            )
-            self.assertEqual(config["file_delay"], 2.5)
-            self.assertEqual(config["post_delay"], 12.0)
-
-    def test_read_config_keeps_absolute_download_directory(self):
-        with tempfile.TemporaryDirectory() as root:
-            absolute = os.path.join(root, "absolute-downloads")
-            config_path = os.path.join(root, "config.json")
-            with open(config_path, "w", encoding="utf-8") as fp:
-                json.dump(
-                    {
-                        "cookie": "test-cookie",
-                        "creators": ["creator-a"],
-                        "download_directory": absolute,
-                    },
-                    fp,
-                )
-
-            config = read_config(config_path, root)
-
-            self.assertEqual(config["download_directory"], absolute)
-            self.assertEqual(config["file_delay"], 0.0)
-            self.assertEqual(config["post_delay"], 5.0)
 
     def test_api_get_uses_browser_fetch_instead_of_curl_session(self):
         result = {
@@ -166,7 +267,8 @@ class FanboxExtractionTests(unittest.TestCase):
                 {"status": 0, "text": "AbortError"},
                 {"status": 200, "text": '{"body":{"ok":true}}'},
             ],
-        ) as fetch, patch.object(fanbox_dl.time, "sleep") as sleep:
+        ) as fetch, patch.object(fanbox_dl.time, "sleep") as sleep, \
+             redirect_stdout(StringIO()):
             self.assertEqual(fanbox_dl.api_get("https://api.fanbox.cc/test"), {"ok": True})
 
         self.assertEqual(fetch.call_count, 2)

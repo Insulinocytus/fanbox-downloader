@@ -1,35 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Fanbox 下载器(curl_cffi 版,可绕过 Cloudflare 拦截)。
-
-用法:
-  1. 第一次:   pip install curl_cffi
-  2. 在 config.json 中填写 cookie、作者列表和下载目录
-  3. 运行:     python fanbox_dl.py
-"""
+"""Fanbox 下载器：通过环境变量配置，并按 cron 常驻运行。"""
 import atexit
 import json
 import os
 import re
+import signal
 import sys
 import time
-import urllib.parse
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from cloakbrowser import launch_persistent_context
+from croniter import croniter
 from curl_cffi import requests
 
-# Windows 控制台中文:先切 UTF-8 再让 Python 输出 UTF-8
-os.system("chcp 65001 >nul")
-sys.stdout.reconfigure(encoding="utf-8")
+PROFILE_DIR = "/data/.cloak-profile"
+OUT = "/data/downloads"
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+DEFAULT_CRON = "0 */6 * * *"
 
-def application_base():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
-
-BASE = application_base()
-CONFIG_FILE = os.path.join(BASE, "config.json")
-PROFILE_DIR = os.path.join(BASE, ".cloak-profile")
-OUT = os.path.join(BASE, "downloads")
+_shutdown_requested = False
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -68,77 +59,80 @@ _sess = None
 _browser_context = None
 _browser_page = None
 _cookie_value = None
-_cookie_ok = False
 
 class CloudflareBlocked(RuntimeError):
     pass
 
-def read_config(path=None, base=None):
-    path = path or CONFIG_FILE
-    base = base or BASE
-    if not os.path.exists(path):
-        sys.exit(f"没找到 {path},请创建 config.json")
+def read_config(env=None):
+    """Read and validate the complete runtime configuration from the environment."""
+    env = os.environ if env is None else env
 
-    try:
-        with open(path, encoding="utf-8") as fp:
-            data = json.load(fp)
-    except (OSError, json.JSONDecodeError) as exc:
-        sys.exit(f"无法读取配置文件 {path}: {exc}")
+    cookie = env.get("FANBOX_COOKIE", "").strip()
+    if not cookie:
+        sys.exit("FANBOX_COOKIE 必须设置且不能为空")
 
-    if not isinstance(data, dict):
-        sys.exit("config.json 必须是 JSON 对象")
+    creators = [creator.strip() for creator in env.get("FANBOX_CREATORS", "").split(",")
+                if creator.strip()]
+    if not creators:
+        sys.exit("FANBOX_CREATORS 必须设置至少一个作者 ID")
 
-    cookie = data.get("cookie", "")
-    if not isinstance(cookie, str):
-        sys.exit("config.json 的 cookie 必须是字符串")
-
-    creators = data.get("creators", [])
-    if not isinstance(creators, list):
-        sys.exit("config.json 的 creators 必须是数组")
-    creators = [creator.strip() for creator in creators
-                if isinstance(creator, str) and creator.strip()]
-
-    download_directory = data.get("download_directory", "downloads")
-    if not isinstance(download_directory, str) or not download_directory.strip():
-        download_directory = "downloads"
-    if not os.path.isabs(download_directory):
-        download_directory = os.path.join(base, download_directory)
+    download_directory = env.get("FANBOX_DOWNLOAD_DIRECTORY", "/data/downloads").strip()
+    if not download_directory:
+        sys.exit("FANBOX_DOWNLOAD_DIRECTORY 不能为空")
+    if not os.path.isabs(download_directory) and not download_directory.startswith("/"):
+        download_directory = os.path.abspath(download_directory)
 
     def read_delay(name, default):
-        value = data.get(name, default)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-            sys.exit(f"config.json 的 {name} 必须是非负数字")
-        return float(value)
+        raw = env.get(name, str(default))
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            sys.exit(f"{name} 必须是非负数字")
+        if value < 0:
+            sys.exit(f"{name} 必须是非负数字")
+        return value
+
+    timezone_name = env.get("FANBOX_TIMEZONE", DEFAULT_TIMEZONE).strip()
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        sys.exit(f"FANBOX_TIMEZONE 无效: {timezone_name}")
+
+    cron_expression = env.get("FANBOX_CRON", DEFAULT_CRON).strip()
+    if not cron_expression or not croniter.is_valid(cron_expression):
+        sys.exit("FANBOX_CRON 必须是有效的五段式 cron 表达式")
+
+    run_on_start = env.get("FANBOX_RUN_ON_START", "false").strip().lower()
+    if run_on_start not in {"true", "false"}:
+        sys.exit("FANBOX_RUN_ON_START 必须是 true 或 false")
 
     return {
-        "cookie": cookie.strip(),
+        "cookie": cookie,
         "creators": creators,
-        "download_directory": os.path.abspath(download_directory),
-        "file_delay": read_delay("file_delay", 0.0),
-        "post_delay": read_delay("post_delay", 5.0),
+        "download_directory": download_directory,
+        "file_delay": read_delay("FANBOX_FILE_DELAY", 0),
+        "post_delay": read_delay("FANBOX_POST_DELAY", 10),
+        "timezone": timezone,
+        "cron": cron_expression,
+        "run_on_start": run_on_start == "true",
     }
 
-def configure():
+def configure(env=None):
     global _cookie_value, OUT, FILE_DELAY, POST_DELAY
-    config = read_config()
+    config = read_config(env)
     _cookie_value = config["cookie"]
     OUT = config["download_directory"]
     FILE_DELAY = config["file_delay"]
     POST_DELAY = config["post_delay"]
-    return config["creators"]
+    return config
 
 def sess():
-    global _sess, _cookie_value, _cookie_ok
+    global _sess, _cookie_value
     if _sess is None:
         if _cookie_value is None:
             configure()
         _sess = requests.Session(impersonate=IMPERSONATE)
-        if _cookie_value:
-            _sess.cookies.set("FANBOXSESSID", _cookie_value, domain=".fanbox.cc")
-            _cookie_ok = True
-        if not _cookie_ok:
-            print("注意:config.json 的 cookie 为空或值不合法。"
-                  "付费帖子只能下到封面,正文下不到。")
+        _sess.cookies.set("FANBOXSESSID", _cookie_value, domain=".fanbox.cc")
     return _sess
 
 def browser_fetch(url):
@@ -149,7 +143,7 @@ def browser_fetch(url):
         print("正在启动 CloakBrowser...", flush=True)
         _browser_context = launch_persistent_context(
             PROFILE_DIR,
-            headless=False,
+            headless=True,
             humanize=True,
         )
         if _cookie_value:
@@ -229,7 +223,7 @@ def api_get(url, retry=RETRY):
                 "已安全停止,稍后重新运行即可从断点继续。"
             )
         if status in (401, 403):
-            sys.exit("登录失效(cookie 无效/过期)。请更新 config.json 的 cookie")
+            sys.exit("登录失效(cookie 无效/过期)。请更新 FANBOX_COOKIE")
         if status != 200:
             raise RuntimeError(f"Fanbox API 返回 HTTP {status}: {response_text[:200]}")
         try:
@@ -318,70 +312,115 @@ def dl(url, path):
 def sanitize(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name).strip(" .")
 
-def main():
-    creators = configure()
-    if not creators:
-        sys.exit("config.json 的 creators 是空的,请先填作者 ID")
+def next_scheduled_time(cron_expression, timezone, now=None):
+    now = now or datetime.now(timezone)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone)
+    else:
+        now = now.astimezone(timezone)
+    return croniter(cron_expression, now).get_next(datetime)
 
-    for creator in creators:
-        print(f"\n===== 作者: {creator} =====")
-        try:
-            urls = post_urls(creator)
-        except Exception as e:
-            print(f"  获取作者帖子列表失败: {e}")
-            continue
 
-        total_new = 0
-        for ui, u in enumerate(urls, 1):
+def run_once(creators):
+    try:
+        for creator in creators:
+            print(f"\n===== 作者: {creator} =====")
             try:
-                posts = api_get(u).get("posts", [])
-                time.sleep(DELAY)
-            except CloudflareBlocked as e:
-                print(f"  {e}")
-                return
+                urls = post_urls(creator)
             except Exception as e:
-                print(f"  第 {ui}/{len(urls)} 页失败: {e}")
+                print(f"  获取作者帖子列表失败: {e}")
                 continue
-            for p in posts:
-                pid = p["id"]
-                if post_downloaded(creator, p):
-                    print(f"  帖子 {pid} 已存在,跳过")
-                    continue
-                print(f"  帖子 {pid} ...", end=" ", flush=True)
+
+            total_new = 0
+            for ui, u in enumerate(urls, 1):
                 try:
-                    title, files = post_files(pid)
-                    if not files:
-                        print("无文件,跳过")
-                        continue
-                    post_dir = post_directory(creator, pid, title)
-                    n = 0
-                    for url, name in files:
-                        ext = (os.path.splitext(name)[1] if name
-                               else os.path.splitext(url.split("?")[0])[1] or ".bin")
-                        fname = f"{pid}_{n}{ext}"
-                        if name:
-                            fname = f"{pid}_{n}_{sanitize(name)}"
-                        path = os.path.join(post_dir, fname)
-                        try:
-                            if dl(url, path):
-                                total_new += 1
-                            n += 1
-                        except CloudflareBlocked:
-                            raise
-                        except Exception as e:
-                            print(f"\n  下载 {url} 失败: {e}")
-                        time.sleep(FILE_DELAY)
-                    print(f"完成({n} 个文件) -> {post_dir}")
+                    posts = api_get(u).get("posts", [])
+                    time.sleep(DELAY)
                 except CloudflareBlocked as e:
-                    print(f"\n  {e}")
+                    print(f"  {e}")
                     return
                 except Exception as e:
-                    print(f"失败: {e}")
-                finally:
-                    time.sleep(POST_DELAY)
-        print(f"  >> 本作者新增 {total_new} 个文件 -> {os.path.join(OUT, creator)}")
+                    print(f"  第 {ui}/{len(urls)} 页失败: {e}")
+                    continue
+                for p in posts:
+                    pid = p["id"]
+                    if post_downloaded(creator, p):
+                        print(f"  帖子 {pid} 已存在,跳过")
+                        continue
+                    print(f"  帖子 {pid} ...", end=" ", flush=True)
+                    try:
+                        title, files = post_files(pid)
+                        if not files:
+                            print("无文件,跳过")
+                            continue
+                        post_dir = post_directory(creator, pid, title)
+                        n = 0
+                        for url, name in files:
+                            ext = (os.path.splitext(name)[1] if name
+                                   else os.path.splitext(url.split("?")[0])[1] or ".bin")
+                            fname = f"{pid}_{n}{ext}"
+                            if name:
+                                fname = f"{pid}_{n}_{sanitize(name)}"
+                            path = os.path.join(post_dir, fname)
+                            try:
+                                if dl(url, path):
+                                    total_new += 1
+                                n += 1
+                            except CloudflareBlocked:
+                                raise
+                            except Exception as e:
+                                print(f"\n  下载 {url} 失败: {e}")
+                            time.sleep(FILE_DELAY)
+                        print(f"完成({n} 个文件) -> {post_dir}")
+                    except CloudflareBlocked as e:
+                        print(f"\n  {e}")
+                        return
+                    except Exception as e:
+                        print(f"失败: {e}")
+                    finally:
+                        time.sleep(POST_DELAY)
+            print(f"  >> 本作者新增 {total_new} 个文件 -> {os.path.join(OUT, creator)}")
 
-    print("\n全部完成。")
+        print("\n全部完成。")
+    finally:
+        close_browser()
+
+
+def run_scheduler(config, run_once_fn=run_once, now_fn=None, sleep_fn=time.sleep):
+    global _shutdown_requested
+    now_fn = now_fn or (lambda: datetime.now(config["timezone"]))
+
+    if config["run_on_start"]:
+        run_once_fn(config["creators"])
+
+    while not _shutdown_requested:
+        next_run = next_scheduled_time(config["cron"], config["timezone"], now_fn())
+        print(f"下一次执行时间: {next_run.isoformat()}", flush=True)
+        while not _shutdown_requested:
+            remaining = (next_run - now_fn()).total_seconds()
+            if remaining <= 0:
+                break
+            sleep_fn(min(remaining, 60))
+        if not _shutdown_requested:
+            run_once_fn(config["creators"])
+
+
+def handle_shutdown(signum, _frame):
+    global _shutdown_requested
+    _shutdown_requested = True
+    print(f"收到信号 {signum}，正在停止调度。", flush=True)
+    close_browser()
+
+
+def main():
+    config = configure()
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    try:
+        run_scheduler(config)
+    finally:
+        close_browser()
+
 
 if __name__ == "__main__":
     main()
