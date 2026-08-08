@@ -13,4 +13,4 @@
 ## 3. 验证发布流程
 
 - [x] 3.1 检查 workflow YAML、触发条件、权限、镜像标签和缓存配置符合规格。
-- [ ] 3.2 在 `main` 提交和版本 tag 发布后验证 Actions 成功，并从 GHCR 验证 `latest` 与版本标签可拉取。
+- [x] 3.2 在 `main` 提交和版本 tag 发布后验证 Actions 成功，并从 GHCR 验证 `latest` 与版本标签可拉取。
