@@ -46,7 +46,7 @@ uv run python -m unittest discover -v
 
 ```dotenv
 FANBOX_COOKIE=你的FANBOXSESSID
-FANBOX_CREATORS=cowmopcat,another-creator
+FANBOX_CREATORS=your-creator-id,another-creator
 FANBOX_TIMEZONE=Asia/Shanghai
 FANBOX_CRON=0 */6 * * *
 FANBOX_RUN_ON_START=false
@@ -113,7 +113,7 @@ services:
     restart: unless-stopped
     environment:
       FANBOX_COOKIE: "你的FANBOXSESSID"
-      FANBOX_CREATORS: "cowmopcat,another-creator"
+      FANBOX_CREATORS: "your-creator-id,another-creator"
       PUID: "3000"
       PGID: "3000"
       FANBOX_TIMEZONE: "Asia/Shanghai"
