@@ -6,7 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser-cache \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    PUID=10001 \
+    PGID=10001
 
 COPY --from=uv /uv /uvx /bin/
 
@@ -14,6 +16,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         fonts-liberation \
+        gosu \
         libasound2 \
         libatk-bridge2.0-0 \
         libatk1.0-0 \
@@ -45,10 +48,14 @@ RUN uv sync --locked --no-dev \
 
 COPY fanbox_dl.py .
 
-RUN useradd --create-home --uid 10001 appuser \
+RUN groupadd --gid 10001 appgroup \
+    && useradd --create-home --uid 10001 --gid appgroup appuser \
     && mkdir -p /data/downloads /data/.cloak-profile \
-    && chown -R appuser:appuser /app /data /opt/cloakbrowser-cache
+    && chown -R appuser:appgroup /app /data /opt/cloakbrowser-cache
 
-USER appuser
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
+
 VOLUME ["/data/downloads", "/data/.cloak-profile"]
-ENTRYPOINT ["python", "fanbox_dl.py"]
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["python", "fanbox_dl.py"]

@@ -37,6 +37,10 @@ uv run python -m unittest discover -v
 | `FANBOX_TIMEZONE` | 否 | `Asia/Shanghai` | IANA 时区名称 |
 | `FANBOX_CRON` | 否 | `0 */6 * * *` | 标准五段式 cron 表达式 |
 | `FANBOX_RUN_ON_START` | 否 | `false` | 是否在容器启动后立即执行一次 |
+| `PUID` | 否 | `10001` | 容器内服务用户的 UID；启动时用于修正可写目录权限 |
+| `PGID` | 否 | `10001` | 容器内服务用户的 GID；启动时用于修正可写目录权限 |
+
+`PUID` 和 `PGID` 必须是非零正整数；值与容器中其他用户或组冲突时，容器会在启动阶段失败。启用自动权限修正时不要设置 Compose 的 `user:`，否则 entrypoint 无法以 root 完成初始化。
 
 示例环境变量文件 `.env`：
 
@@ -46,6 +50,8 @@ FANBOX_CREATORS=cowmopcat,another-creator
 FANBOX_TIMEZONE=Asia/Shanghai
 FANBOX_CRON=0 */6 * * *
 FANBOX_RUN_ON_START=false
+PUID=10001
+PGID=10001
 ```
 
 `.env` 只是 Docker 的环境变量注入方式，不会被应用读取，也不要提交到 Git。
@@ -98,7 +104,35 @@ docker run -d \
   fanbox-downloader
 ```
 
-镜像使用非 root 用户运行。使用宿主机目录时，请确保挂载目录对容器用户可写；named volume 通常不需要额外处理。
+容器启动时会短暂以 root 初始化用户和目录权限，随后以 `PUID:PGID` 运行 Python 程序；Python 程序不会以 root 运行。使用宿主机目录时，将 `PUID`/`PGID` 设置为宿主机用户和组的 ID，entrypoint 会自动修正挂载目录权限。使用该模式时不要在 Compose 中设置 `user:`。
+
+使用 Docker Compose（bind mount + UID/GID 3000）：
+
+```yaml
+services:
+  fanbox-downloader:
+    image: ghcr.io/insulinocytus/fanbox-downloader:latest
+    container_name: fanbox-downloader
+    restart: unless-stopped
+    environment:
+      FANBOX_COOKIE: "你的FANBOXSESSID"
+      FANBOX_CREATORS: "cowmopcat,another-creator"
+      PUID: "3000"
+      PGID: "3000"
+      FANBOX_TIMEZONE: "Asia/Shanghai"
+      FANBOX_CRON: "0 */6 * * *"
+      FANBOX_RUN_ON_START: "false"
+    volumes:
+      - ./data/downloads:/data/downloads
+      - ./data/cloak-profile:/data/.cloak-profile
+```
+
+使用 `PUID`/`PGID` 时不要同时设置 `user:`。启动前创建宿主机目录：
+
+```bash
+mkdir -p data/downloads data/cloak-profile
+docker compose up -d
+```
 
 查看日志：
 
