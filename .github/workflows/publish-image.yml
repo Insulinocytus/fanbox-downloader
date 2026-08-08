@@ -55,7 +55,7 @@ jobs:
 
       - name: Verify runtime UID and GID
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          IMAGE: ${{ steps.meta.outputs.tags }}
         run: |
           set -eu
           docker pull "$IMAGE"
