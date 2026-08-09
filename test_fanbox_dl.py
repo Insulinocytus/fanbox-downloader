@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -298,6 +299,323 @@ class FanboxExtractionTests(unittest.TestCase):
                 "  Cloudflare 冷却中,剩余约 5 秒",
             ],
         )
+
+
+class IncrementalScanTests(unittest.TestCase):
+    def run_with_pages(self, root, state, pages, process_result=("downloaded", 0)):
+        with patch("fanbox_dl.OUT", root):
+            fanbox_dl.save_state(state)
+            with patch.object(fanbox_dl, "post_urls", return_value=list(pages)), \
+                 patch.object(
+                     fanbox_dl,
+                     "api_get",
+                     side_effect=lambda url: {"posts": pages[url]},
+                 ) as api_get, patch.object(
+                     fanbox_dl, "process_post", return_value=process_result
+                 ) as process, patch.object(fanbox_dl, "close_browser"), \
+                 patch.object(fanbox_dl.time, "sleep"), redirect_stdout(StringIO()):
+                fanbox_dl.run_once(["creator"])
+            loaded, _ = fanbox_dl.load_state()
+        return api_get, process, loaded
+
+    def test_fast_scan_stops_after_two_pages_that_were_already_known(self):
+        state = {
+            "version": 1,
+            "creators": {
+                "creator": {
+                    "initialized": True,
+                    "posts": {"1": "empty", "2": "empty"},
+                }
+            },
+        }
+        pages = {
+            "page-1": [{"id": "1", "isPinned": True}],
+            "page-2": [{"id": "2"}],
+            "page-3": [{"id": "3"}],
+        }
+
+        with tempfile.TemporaryDirectory() as root:
+            api_get, process, loaded = self.run_with_pages(root, state, pages)
+
+        self.assertEqual([call.args[0] for call in api_get.call_args_list], ["page-1", "page-2"])
+        process.assert_not_called()
+        self.assertNotIn("3", loaded["creators"]["creator"]["posts"])
+
+    def test_unknown_pages_do_not_count_toward_known_page_overlap(self):
+        state = {
+            "version": 1,
+            "creators": {
+                "creator": {
+                    "initialized": True,
+                    "posts": {"1": "empty", "2": "empty"},
+                }
+            },
+        }
+        pages = {
+            "page-1": [{"id": "10"}],
+            "page-2": [{"id": "11"}],
+            "page-3": [{"id": "1"}],
+            "page-4": [{"id": "2"}],
+            "page-5": [{"id": "12"}],
+        }
+
+        with tempfile.TemporaryDirectory() as root:
+            api_get, process, _ = self.run_with_pages(root, state, pages)
+
+        self.assertEqual(
+            [call.args[0] for call in api_get.call_args_list],
+            ["page-1", "page-2", "page-3", "page-4"],
+        )
+        self.assertEqual([call.args[1]["id"] for call in process.call_args_list], ["10", "11"])
+
+    def test_uninitialized_creator_scans_every_page_and_marks_initialized(self):
+        pages = {
+            "page-1": [{"id": "1"}],
+            "page-2": [{"id": "2"}],
+            "page-3": [{"id": "3"}],
+        }
+
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root), \
+             patch.object(fanbox_dl, "post_urls", return_value=list(pages)), \
+             patch.object(fanbox_dl, "api_get", side_effect=lambda url: {"posts": pages[url]}) as api_get, \
+             patch.object(fanbox_dl, "process_post", return_value=("empty", 0)), \
+             patch.object(fanbox_dl, "close_browser"), patch.object(fanbox_dl.time, "sleep"), \
+             redirect_stdout(StringIO()):
+            fanbox_dl.run_once(["creator"])
+            state, valid = fanbox_dl.load_state()
+
+        self.assertTrue(valid)
+        self.assertEqual(api_get.call_count, 3)
+        self.assertTrue(state["creators"]["creator"]["initialized"])
+
+    def test_failed_initialization_retries_full_scan_next_run(self):
+        pages = {"page-1": [{"id": "1"}], "page-2": [{"id": "2"}]}
+
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root), \
+             patch.object(fanbox_dl, "post_urls", return_value=list(pages)), \
+             patch.object(fanbox_dl, "api_get", side_effect=lambda url: {"posts": pages[url]}) as api_get, \
+             patch.object(
+                 fanbox_dl,
+                 "process_post",
+                 side_effect=[(None, 0), ("empty", 0), ("empty", 0)],
+             ), patch.object(fanbox_dl, "close_browser"), patch.object(fanbox_dl.time, "sleep"), \
+             redirect_stdout(StringIO()):
+            fanbox_dl.run_once(["creator"])
+            first, _ = fanbox_dl.load_state()
+            fanbox_dl.run_once(["creator"])
+            second, _ = fanbox_dl.load_state()
+
+        self.assertFalse(first["creators"]["creator"]["initialized"])
+        self.assertTrue(second["creators"]["creator"]["initialized"])
+        self.assertEqual(api_get.call_count, 4)
+
+    def test_missing_download_directory_is_retried_before_page_scan(self):
+        state = {
+            "version": 1,
+            "creators": {
+                "creator": {
+                    "initialized": True,
+                    "posts": {"123": "downloaded"},
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as root:
+            _, process, _ = self.run_with_pages(root, state, {})
+
+        process.assert_called_once_with("creator", {"id": "123"})
+
+    def test_failed_missing_directory_repair_is_retried_next_run(self):
+        state = {
+            "version": 1,
+            "creators": {
+                "creator": {
+                    "initialized": True,
+                    "posts": {"1": "empty", "2": "empty", "123": "downloaded"},
+                }
+            },
+        }
+        pages = {
+            "page-1": [{"id": "1"}],
+            "page-2": [{"id": "2"}],
+            "page-3": [{"id": "123"}],
+        }
+
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root):
+            fanbox_dl.save_state(state)
+
+            def process_post(creator, post):
+                if not os.path.isdir(os.path.join(root, creator, "123-title")):
+                    os.makedirs(os.path.join(root, creator, "123-title"))
+                    return None, 0
+                return "downloaded", 0
+
+            with patch.object(fanbox_dl, "post_urls", return_value=list(pages)), \
+                 patch.object(
+                     fanbox_dl, "api_get", side_effect=lambda url: {"posts": pages[url]}
+                 ), patch.object(fanbox_dl, "process_post", side_effect=process_post) as process, \
+                 patch.object(fanbox_dl, "close_browser"), \
+                 patch.object(fanbox_dl.time, "sleep"), redirect_stdout(StringIO()):
+                fanbox_dl.run_once(["creator"])
+                fanbox_dl.run_once(["creator"])
+
+            loaded, _ = fanbox_dl.load_state()
+
+        self.assertEqual([call.args[1]["id"] for call in process.call_args_list], ["123", "123"])
+        self.assertEqual(loaded["creators"]["creator"]["posts"]["123"], "downloaded")
+        self.assertTrue(loaded["creators"]["creator"]["initialized"])
+
+
+class PostProcessingTests(unittest.TestCase):
+    def test_restricted_post_is_recorded_without_fetching_details(self):
+        with patch.object(fanbox_dl, "post_files") as post_files:
+            status, downloaded = fanbox_dl.process_post(
+                "creator", {"id": "123", "isRestricted": True}
+            )
+
+        self.assertEqual((status, downloaded), ("restricted", 0))
+        post_files.assert_not_called()
+
+    def test_post_without_files_is_recorded_as_empty(self):
+        with patch.object(fanbox_dl, "post_files", return_value=("title", [])), \
+             redirect_stdout(StringIO()):
+            status, downloaded = fanbox_dl.process_post("creator", {"id": "123"})
+
+        self.assertEqual((status, downloaded), ("empty", 0))
+
+    def test_post_is_downloaded_only_when_every_file_succeeds(self):
+        files = [("https://example/1.jpg", ""), ("https://example/2.jpg", "")]
+        with patch.object(fanbox_dl, "post_files", return_value=("title", files)), \
+             patch.object(fanbox_dl, "dl", side_effect=[True, False]) as download, \
+             patch.object(fanbox_dl.time, "sleep"), redirect_stdout(StringIO()):
+            status, downloaded = fanbox_dl.process_post("creator", {"id": "123"})
+
+        self.assertEqual((status, downloaded), ("downloaded", 1))
+        self.assertEqual(download.call_count, 2)
+
+    def test_partial_failure_stays_unfinished_and_retry_skips_existing_files(self):
+        files = [("https://example/1.jpg", ""), ("https://example/2.jpg", "")]
+        with patch.object(fanbox_dl, "post_files", return_value=("title", files)), \
+             patch.object(
+                 fanbox_dl,
+                 "dl",
+                 side_effect=[True, RuntimeError("failed"), False, True],
+             ) as download, patch.object(fanbox_dl.time, "sleep"), \
+             redirect_stdout(StringIO()):
+            first = fanbox_dl.process_post("creator", {"id": "123"})
+            second = fanbox_dl.process_post("creator", {"id": "123"})
+
+        self.assertEqual(first, (None, 1))
+        self.assertEqual(second, ("downloaded", 1))
+        self.assertEqual(download.call_count, 4)
+
+
+class PostStateTests(unittest.TestCase):
+    def test_state_round_trip_preserves_each_creator(self):
+        state = {
+            "version": 1,
+            "creators": {
+                "creator-a": {
+                    "initialized": True,
+                    "posts": {"1": "downloaded", "2": "empty"},
+                },
+                "creator-b": {
+                    "initialized": False,
+                    "posts": {"3": "restricted"},
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root):
+            fanbox_dl.save_state(state)
+            loaded, valid = fanbox_dl.load_state()
+
+        self.assertTrue(valid)
+        self.assertEqual(loaded, state)
+
+    def test_invalid_state_warns_and_returns_empty_state(self):
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root):
+            with open(os.path.join(root, ".fanbox-state.json"), "w", encoding="utf-8") as fp:
+                fp.write("not-json")
+
+            output = StringIO()
+            with redirect_stdout(output):
+                state, valid = fanbox_dl.load_state()
+
+        self.assertFalse(valid)
+        self.assertEqual(state, {"version": 1, "creators": {}})
+        self.assertIn("状态文件", output.getvalue())
+
+    def test_invalid_state_shape_warns_and_returns_empty_state(self):
+        invalid = {
+            "version": 1,
+            "creators": {
+                "creator": {"initialized": True, "posts": {"1": {}}}
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root):
+            with open(os.path.join(root, ".fanbox-state.json"), "w", encoding="utf-8") as fp:
+                json.dump(invalid, fp)
+
+            with redirect_stdout(StringIO()):
+                state, valid = fanbox_dl.load_state()
+
+        self.assertFalse(valid)
+        self.assertEqual(state, {"version": 1, "creators": {}})
+
+    def test_migrates_existing_post_directories_into_new_state(self):
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root):
+            os.makedirs(os.path.join(root, "creator", "123-old-title"))
+            os.makedirs(os.path.join(root, "creator", "456-another-title"))
+            os.makedirs(os.path.join(root, "creator", "not-a-post"))
+            state = {"version": 1, "creators": {}}
+
+            fanbox_dl.migrate_existing_posts(state, ["creator"])
+
+        self.assertEqual(
+            state["creators"]["creator"],
+            {
+                "initialized": False,
+                "posts": {"123": "downloaded", "456": "downloaded"},
+            },
+        )
+
+    def test_finds_downloaded_posts_whose_directory_was_deleted(self):
+        state = {
+            "version": 1,
+            "creators": {
+                "creator": {
+                    "initialized": True,
+                    "posts": {"123": "downloaded", "456": "downloaded", "789": "empty"},
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root):
+            os.makedirs(os.path.join(root, "creator", "456-renamed-title"))
+
+            missing = fanbox_dl.missing_downloaded_posts(state, "creator")
+
+        self.assertEqual(missing, ["123"])
+
+    def test_save_state_replaces_a_temporary_file_atomically(self):
+        state = {"version": 1, "creators": {}}
+        calls = []
+
+        with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root), \
+             patch("fanbox_dl.os.replace", side_effect=lambda source, target: (
+                 calls.append((source, target)), os.rename(source, target)
+             )[-1]):
+            fanbox_dl.save_state(state)
+
+            with open(os.path.join(root, ".fanbox-state.json"), encoding="utf-8") as fp:
+                saved = json.load(fp)
+
+        self.assertEqual(saved, state)
+        self.assertEqual(len(calls), 1)
+        self.assertNotEqual(calls[0][0], calls[0][1])
+        self.assertTrue(calls[0][0].endswith(".tmp"))
 
 
 if __name__ == "__main__":
