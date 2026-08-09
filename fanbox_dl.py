@@ -356,13 +356,6 @@ def existing_post_ids(creator):
         return set()
 
 
-def migrate_existing_posts(state, creators):
-    for creator in creators:
-        posts = creator_state(state, creator)["posts"]
-        for post_id in existing_post_ids(creator):
-            posts[post_id] = "downloaded"
-
-
 def missing_downloaded_posts(state, creator):
     existing = existing_post_ids(creator)
     posts = creator_state(state, creator)["posts"]
@@ -438,7 +431,6 @@ def process_post(creator, post):
 def run_once(creators):
     state, valid = load_state()
     if not valid:
-        migrate_existing_posts(state, creators)
         save_state(state)
 
     try:

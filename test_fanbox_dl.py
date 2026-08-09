@@ -564,22 +564,24 @@ class PostStateTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertEqual(state, {"version": 1, "creators": {}})
 
-    def test_migrates_existing_post_directories_into_new_state(self):
+    def test_existing_post_directory_does_not_initialize_downloaded_state(self):
+        pages = {"page-1": [{"id": "123"}]}
+
         with tempfile.TemporaryDirectory() as root, patch("fanbox_dl.OUT", root):
             os.makedirs(os.path.join(root, "creator", "123-old-title"))
-            os.makedirs(os.path.join(root, "creator", "456-another-title"))
-            os.makedirs(os.path.join(root, "creator", "not-a-post"))
-            state = {"version": 1, "creators": {}}
+            with patch.object(fanbox_dl, "post_urls", return_value=list(pages)), \
+                 patch.object(
+                     fanbox_dl, "api_get", side_effect=lambda url: {"posts": pages[url]}
+                 ), patch.object(
+                     fanbox_dl, "process_post", return_value=("empty", 0)
+                 ) as process, patch.object(fanbox_dl, "close_browser"), \
+                 patch.object(fanbox_dl.time, "sleep"), redirect_stdout(StringIO()):
+                fanbox_dl.run_once(["creator"])
+                state, valid = fanbox_dl.load_state()
 
-            fanbox_dl.migrate_existing_posts(state, ["creator"])
-
-        self.assertEqual(
-            state["creators"]["creator"],
-            {
-                "initialized": False,
-                "posts": {"123": "downloaded", "456": "downloaded"},
-            },
-        )
+        self.assertTrue(valid)
+        process.assert_called_once_with("creator", {"id": "123"})
+        self.assertEqual(state["creators"]["creator"]["posts"]["123"], "empty")
 
     def test_finds_downloaded_posts_whose_directory_was_deleted(self):
         state = {
