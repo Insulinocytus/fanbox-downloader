@@ -17,6 +17,7 @@ from creator_sync import (
     CloudflareBlocked,
     CreatorSync,
     FanboxTimeout,
+    PostDetail,
     RetryableFanboxError,
     wait_with_progress,
 )
@@ -28,11 +29,21 @@ creator_sync.API_DELAY = 0
 class ScriptedFanbox:
     """用字典脚本化 Fanbox 单次领域操作的测试适配器。"""
 
-    def __init__(self, *, pages=None, posts=None, details=None, content=None, failures=None):
+    def __init__(
+        self,
+        *,
+        pages=None,
+        posts=None,
+        details=None,
+        content=None,
+        sizes=None,
+        failures=None,
+    ):
         self.pages = pages or {}
         self.posts = posts or {}
         self.details = details or {}
         self.content = content or {}
+        self.sizes = sizes or {}
         self.failures = {key: deque(value) for key, value in (failures or {}).items()}
         self.calls = []
         self.closed = False
@@ -55,7 +66,10 @@ class ScriptedFanbox:
 
     def post_detail(self, post_id):
         self._call("post_detail", post_id)
-        return self.details[post_id]
+        detail = self.details[post_id]
+        if isinstance(detail, PostDetail):
+            return detail
+        return PostDetail(*detail)
 
     def download_file(self, url, path):
         self._call("download_file", url)
@@ -65,6 +79,10 @@ class ScriptedFanbox:
         with open(path, "wb") as fp:
             fp.write(self.content[url])
         return True
+
+    def file_size(self, url):
+        self._call("file_size", url)
+        return self.sizes.get(url)
 
     def close(self):
         self.calls.append(("close", None))
@@ -341,6 +359,18 @@ class FanboxAdapterTests(unittest.TestCase):
 
         self.assertEqual(posts, [{"id": "1"}])
 
+    def test_post_detail_reports_restricted_content_without_extracting_files(self):
+        body = {"post": {"title": "locked", "isRestricted": True}}
+        with patch.object(fanbox_dl, "_api_get_once", return_value=body):
+            detail = Fanbox().post_detail("123")
+
+        self.assertEqual(detail, PostDetail("locked", [], True))
+
+        body["post"]["isRestricted"] = "false"
+        with patch.object(fanbox_dl, "_api_get_once", return_value=body), \
+             self.assertRaises(RetryableFanboxError):
+            Fanbox().post_detail("123")
+
     def test_pagination_rejects_missing_or_invalid_lists(self):
         for body, operation in [
             ({}, lambda fanbox: fanbox.author_pages("creator")),
@@ -348,6 +378,10 @@ class FanboxAdapterTests(unittest.TestCase):
             ({}, lambda fanbox: fanbox.page_posts("page-1")),
             ({"posts": {}}, lambda fanbox: fanbox.page_posts("page-1")),
             ({"posts": [{}]}, lambda fanbox: fanbox.page_posts("page-1")),
+            (
+                {"posts": [{"id": "1", "isRestricted": "false"}]},
+                lambda fanbox: fanbox.page_posts("page-1"),
+            ),
             ({"pageUrls": [None]}, lambda fanbox: fanbox.author_pages("creator")),
         ]:
             with self.subTest(body=body), patch.object(
@@ -391,7 +425,10 @@ class FanboxAdapterTests(unittest.TestCase):
     def test_file_operation_uses_curl_and_writes_bytes(self):
         class Response:
             status_code = 200
-            text = ""
+
+            @property
+            def text(self):
+                raise AssertionError("successful stream body must not be buffered")
 
             def raise_for_status(self):
                 pass
@@ -411,6 +448,48 @@ class FanboxAdapterTests(unittest.TestCase):
 
         self.assertTrue(created)
         self.assertEqual(content, b"file bytes")
+
+    def test_file_size_uses_head_and_requires_valid_content_length(self):
+        class Response:
+            status_code = 200
+            text = ""
+            headers = {"Content-Length": "123"}
+
+        class Session:
+            def __init__(self):
+                self.calls = []
+
+            def head(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return Response()
+
+        session = Session()
+        with patch.object(fanbox_dl, "sess", return_value=session):
+            size = Fanbox().file_size("https://example/file")
+            Response.headers = {"Content-Length": "invalid"}
+            invalid = Fanbox().file_size("https://example/file")
+            Response.headers = {"Content-Length": "²"}
+            unicode_digit = Fanbox().file_size("https://example/file")
+            Response.headers = {"Content-Length": "9" * 5000}
+            oversized = Fanbox().file_size("https://example/file")
+            Response.headers = {}
+            missing = Fanbox().file_size("https://example/file")
+
+        self.assertEqual(size, 123)
+        self.assertIsNone(invalid)
+        self.assertIsNone(unicode_digit)
+        self.assertIsNone(oversized)
+        self.assertIsNone(missing)
+        self.assertEqual(session.calls[0][0], ("https://example/file",))
+        self.assertEqual(
+            session.calls[0][1],
+            {
+                "impersonate": fanbox_dl.IMPERSONATE,
+                "headers": {"Accept-Encoding": "identity"},
+                "allow_redirects": True,
+                "timeout": 60,
+            },
+        )
 
     def test_file_operation_classifies_cloudflare_challenge(self):
         class Response:
@@ -695,7 +774,8 @@ class CreatorSyncTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            CreatorSync(sync_config(root), fanbox).run()
+            sync = CreatorSync(sync_config(root), fanbox)
+            sync.run()
             creators, posts = read_download_state(root)
             manifest = read_manifest(root, "1")
             post_dir = os.path.join(root, "creator", "1-标题__测试")
@@ -703,6 +783,13 @@ class CreatorSyncTests(unittest.TestCase):
                 cover = fp.read()
             with open(os.path.join(post_dir, "1_1_a_b.zip"), "rb") as fp:
                 archive = fp.read()
+            fanbox.pages["creator"] = ["changed"]
+            fanbox.posts["changed"] = [{"id": "2"}, {"id": "3"}]
+            fanbox.details["2"] = ("now downloadable", [(file_url, "")])
+            fanbox.details["3"] = ("now public", [(file_url, "")])
+            fanbox.calls.clear()
+            sync.run()
+            terminal_calls = list(fanbox.calls)
 
         self.assertEqual(creators, {"creator": 1})
         self.assertEqual((cover, archive), (b"cover", b"archive"))
@@ -731,6 +818,8 @@ class CreatorSyncTests(unittest.TestCase):
             ],
         )
         self.assertTrue(fanbox.closed)
+        self.assertFalse(any(call[0] == "post_detail" for call in terminal_calls))
+        self.assertFalse(any(call[0] == "download_file" for call in terminal_calls))
 
     def test_failed_baseline_page_is_persisted_and_full_scan_retries(self):
         fanbox = ScriptedFanbox(
@@ -1203,6 +1292,200 @@ class CreatorSyncTests(unittest.TestCase):
         self.assertEqual(recovered, [contents[url] for url in urls])
         self.assertTrue(all(row["phase"] == "complete" for row in manifest))
         self.assertTrue(parts_removed)
+
+    def test_state_rebuild_adopts_only_existing_files_with_reliable_matching_size(self):
+        adopted_url = "https://example/adopted.bin"
+        changed_url = "https://example/changed.bin"
+        unknown_url = "https://example/unknown.bin"
+        local_adopted = b"local-old"
+        remote_adopted = b"remote-new"
+        remote_changed = b"replacement"
+        remote_unknown = b"downloaded"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={
+                "123": (
+                    "title",
+                    [(adopted_url, ""), (changed_url, ""), (unknown_url, "")],
+                )
+            },
+            content={
+                adopted_url: remote_adopted,
+                changed_url: remote_changed,
+                unknown_url: remote_unknown,
+            },
+            sizes={
+                adopted_url: len(local_adopted),
+                changed_url: len(remote_changed),
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            post_dir = os.path.join(root, "creator", "123-title")
+            os.makedirs(post_dir)
+            existing = [
+                os.path.join(post_dir, f"123_{index}.bin") for index in range(3)
+            ]
+            for path, content in zip(
+                existing, [local_adopted, b"short", b"unknown local"]
+            ):
+                with open(path, "wb") as fp:
+                    fp.write(content)
+
+            CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep).run()
+            rebuilt_manifest = read_manifest(root, "123")
+            rebuilt = []
+            for path in existing:
+                with open(path, "rb") as fp:
+                    rebuilt.append(fp.read())
+
+        self.assertEqual(
+            [key for operation, key in fanbox.calls if operation == "file_size"],
+            [adopted_url, changed_url, unknown_url],
+        )
+        self.assertEqual(
+            [key for operation, key in fanbox.calls if operation == "download_file"],
+            [changed_url, unknown_url],
+        )
+        self.assertEqual(rebuilt, [local_adopted, remote_changed, remote_unknown])
+        self.assertEqual(
+            [row["expected_size"] for row in rebuilt_manifest],
+            [len(local_adopted), len(remote_changed), len(remote_unknown)],
+        )
+
+    def test_state_rebuild_downloads_when_size_check_retries_are_exhausted(self):
+        url = "https://example/file.bin"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={"123": ("title", [(url, "")])},
+            content={url: b"remote"},
+            failures={
+                ("file_size", url): retry_failures("HEAD unavailable")
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()), \
+             self.assertLogs("creator_sync", level="ERROR") as logs:
+            post_dir = os.path.join(root, "creator", "123-title")
+            os.makedirs(post_dir)
+            final_path = os.path.join(post_dir, "123_0.bin")
+            with open(final_path, "wb") as fp:
+                fp.write(b"local")
+
+            CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep).run()
+            with open(final_path, "rb") as fp:
+                rebuilt = fp.read()
+            _, posts = read_download_state(root)
+
+        self.assertEqual(fanbox.calls.count(("file_size", url)), creator_sync.MAX_ATTEMPTS)
+        self.assertEqual(fanbox.calls.count(("download_file", url)), 1)
+        self.assertEqual(rebuilt, b"remote")
+        self.assertEqual(posts[("creator", "123")]["status"], "downloaded")
+        self.assertIn("escalation=download_full", "\n".join(logs.output))
+
+    def test_renamed_post_directory_resets_only_the_original_snapshot_path(self):
+        old_url = "https://example/old.bin"
+        current_url = "https://example/current.bin"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={"123": ("old", [(old_url, "")])},
+            content={old_url: b"old", current_url: b"current"},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep)
+            sync.run()
+            original_dir = os.path.join(root, "creator", "123-old")
+            renamed_dir = os.path.join(root, "creator", "123-user-renamed")
+            os.rename(original_dir, renamed_dir)
+            fanbox.details["123"] = ("current", [(current_url, "")])
+            fanbox.calls.clear()
+
+            sync.run()
+            _, posts = read_download_state(root)
+            manifest = read_manifest(root, "123")
+            current_dir = os.path.join(root, "creator", "123-current")
+            with open(os.path.join(renamed_dir, "123_0.bin"), "rb") as fp:
+                renamed_content = fp.read()
+            with open(os.path.join(current_dir, "123_0.bin"), "rb") as fp:
+                current_content = fp.read()
+
+        self.assertEqual(renamed_content, b"old")
+        self.assertEqual(current_content, b"current")
+        self.assertEqual(posts[("creator", "123")]["directory_path"], current_dir)
+        self.assertEqual([row["resource_url"] for row in manifest], [current_url])
+        self.assertEqual(
+            [key for operation, key in fanbox.calls if operation == "post_detail"],
+            ["123"],
+        )
+
+    def test_missing_snapshot_directory_uses_current_restricted_listing(self):
+        url = "https://example/file.bin"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={"123": ("old", [(url, "")])},
+            content={url: b"old"},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep)
+            sync.run()
+            original_dir = os.path.join(root, "creator", "123-old")
+            renamed_dir = os.path.join(root, "creator", "123-renamed")
+            os.rename(original_dir, renamed_dir)
+            fanbox.posts["page-1"] = [
+                {"id": "123", "title": "locked", "isRestricted": True}
+            ]
+            fanbox.calls.clear()
+
+            sync.run()
+            _, posts = read_download_state(root)
+            renamed_preserved = os.path.isdir(renamed_dir)
+
+        self.assertEqual(posts[("creator", "123")]["status"], "restricted")
+        self.assertTrue(renamed_preserved)
+        self.assertFalse(any(call[0] == "post_detail" for call in fanbox.calls))
+        self.assertFalse(any(call[0] == "download_file" for call in fanbox.calls))
+
+    def test_unscanned_restricted_post_detail_completes_snapshot_reset(self):
+        url = "https://example/file.bin"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["newest", "known", "oldest"]},
+            posts={
+                "newest": [{"id": "300"}],
+                "known": [{"id": "200"}],
+                "oldest": [{"id": "123"}],
+            },
+            details={
+                "300": ("empty", []),
+                "200": ("empty", []),
+                "123": ("old", [(url, "")]),
+            },
+            content={url: b"old"},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep)
+            sync.run()
+            original_dir = os.path.join(root, "creator", "123-old")
+            os.rename(original_dir, os.path.join(root, "creator", "123-renamed"))
+            fanbox.details["123"] = ("locked", [], True)
+            fanbox.calls.clear()
+
+            sync.run()
+            _, posts = read_download_state(root)
+
+        self.assertEqual(
+            [key for operation, key in fanbox.calls if operation == "page_posts"],
+            ["newest", "known"],
+        )
+        self.assertIn(("post_detail", "123"), fanbox.calls)
+        self.assertEqual(posts[("creator", "123")]["status"], "restricted")
+        self.assertFalse(any(call[0] == "download_file" for call in fanbox.calls))
 
 
 class StateDatabaseTests(unittest.TestCase):

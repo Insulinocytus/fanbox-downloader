@@ -88,6 +88,13 @@ class SyncResult:
 
 
 @dataclass(frozen=True)
+class PostDetail:
+    title: str
+    files: list[tuple[str, str]]
+    is_restricted: bool = False
+
+
+@dataclass(frozen=True)
 class _PostResult:
     status: str | None
     downloaded_file_count: int
@@ -334,12 +341,21 @@ class _DownloadState:
             self.connection.executemany(
                 """
                 INSERT INTO files(
-                    creator_id, post_id, position, local_name, resource_url, phase
-                ) VALUES (?, ?, ?, ?, ?, 'downloading')
+                    creator_id, post_id, position, local_name, resource_url,
+                    expected_size, phase
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (key.creator_id, key.post_id, position, local_name, resource_url)
-                    for position, local_name, resource_url in files
+                    (
+                        key.creator_id,
+                        key.post_id,
+                        file.position,
+                        file.local_name,
+                        file.resource_url,
+                        file.expected_size,
+                        file.phase,
+                    )
+                    for file in files
                 ],
             )
 
@@ -467,7 +483,9 @@ def _manifest_entries(post_id, files):
         local_name = f"{post_id}_{position}{extension}"
         if name:
             local_name = f"{post_id}_{position}_{_sanitize(name)}"
-        entries.append((position, local_name, resource_url))
+        entries.append(
+            _ManifestFile(position, local_name, resource_url, None, "downloading")
+        )
     return entries
 
 
@@ -629,6 +647,7 @@ class CreatorSync:
             return "partial", total_new
 
         known_pages = 0
+        current_posts = {}
         for page_number, url in enumerate(urls, 1):
             try:
                 posts = self._metadata(
@@ -636,6 +655,8 @@ class CreatorSync:
                     operation_name="page_posts",
                     creator_id=creator,
                 )
+                for post in posts:
+                    current_posts.setdefault(str(post["id"]), post)
                 page_was_known = database.record_page(creator, posts)
             except sqlite3.Error:
                 raise
@@ -691,7 +712,9 @@ class CreatorSync:
                 partial = True
 
         try:
-            repair_outcome, repaired = self._repair_downloads(database, creator)
+            repair_outcome, repaired = self._repair_downloads(
+                database, creator, current_posts
+            )
         except RetryExhausted as exc:
             return "partial", total_new
         total_new += repaired
@@ -738,7 +761,7 @@ class CreatorSync:
         finally:
             self.sleep_fn(self.post_delay)
 
-    def _repair_downloads(self, database, creator):
+    def _repair_downloads(self, database, creator, current_posts):
         downloaded_file_count = 0
         partial = False
         for post in database.downloaded_posts(creator):
@@ -746,6 +769,7 @@ class CreatorSync:
             post_id = key.post_id
             directory_path = post["directory_path"]
             files = database.manifest_files(key)
+            repair_post = {"id": post_id}
 
             if not directory_path or not os.path.isdir(directory_path):
                 logger.info(
@@ -754,6 +778,7 @@ class CreatorSync:
                     post_id,
                 )
                 database.reset_post(key)
+                repair_post = current_posts.get(post_id, repair_post)
             else:
                 broken = [
                     file.position
@@ -781,12 +806,13 @@ class CreatorSync:
                         post_id,
                     )
                     database.reset_post(key)
+                    repair_post = current_posts.get(post_id, repair_post)
 
             try:
                 result = self._attempt_recorded_post(
                     database,
                     creator,
-                    {"id": post_id},
+                    repair_post,
                     f"  帖子 {post_id} 下载修复失败",
                 )
             except CloudflareBlocked as exc:
@@ -827,6 +853,7 @@ class CreatorSync:
         creator_id=None,
         post_id=None,
         file_path=None,
+        exhausted_escalation=None,
     ):
         """Run one remote operation with the shared ordinary-failure policy."""
         last_error = None
@@ -878,16 +905,17 @@ class CreatorSync:
                 self._cloudflare_streak = 0
                 last_error = exc
                 if attempt >= MAX_ATTEMPTS:
+                    escalation = exhausted_escalation or f"skip_{scope.value}"
                     logger.error(
                         "operation=%s author=%s post=%s file=%s category=retryable "
-                        "attempt=%s/%s wait=none escalation=skip_%s error=%s",
+                        "attempt=%s/%s wait=none escalation=%s error=%s",
                         operation_name,
                         creator_id,
                         post_id,
                         file_path,
                         attempt,
                         MAX_ATTEMPTS,
-                        scope.value,
+                        escalation,
                         exc,
                     )
                     raise RetryExhausted(
@@ -952,12 +980,16 @@ class CreatorSync:
             title = str(post.get("title") or post_id)
             return _PostResult("restricted", 0, title, None)
 
-        title, files = self._metadata(
+        detail = self._metadata(
             lambda: self.fanbox.post_detail(post_id),
             operation_name="post_detail",
             creator_id=key.creator_id,
             post_id=post_id,
         )
+        title = detail.title
+        files = detail.files
+        if detail.is_restricted:
+            return _PostResult("restricted", 0, title, None)
         if not files:
             logger.info(
                 "operation=process_post author=%s post=%s outcome=empty",
@@ -967,15 +999,50 @@ class CreatorSync:
             return _PostResult("empty", 0, title, None)
 
         directory_path = _post_directory(self.root, key.creator_id, post_id, title)
+        manifest = self._initialize_manifest(
+            key, directory_path, _manifest_entries(post_id, files)
+        )
         database.create_manifest(
             key,
             title,
             directory_path,
-            _manifest_entries(post_id, files),
+            manifest,
         )
         return self._download_manifest(
             database, key, title, directory_path
         )
+
+    def _initialize_manifest(self, key, directory_path, manifest):
+        initialized = []
+        for file in manifest:
+            final_path = os.path.join(directory_path, file.local_name)
+            if not os.path.isfile(final_path):
+                initialized.append(file)
+                continue
+            try:
+                expected_size = self._retry(
+                    lambda file=file: self.fanbox.file_size(file.resource_url),
+                    scope=RetryScope.FILE,
+                    operation_name="file_size",
+                    creator_id=key.creator_id,
+                    post_id=key.post_id,
+                    file_path=final_path,
+                    exhausted_escalation="download_full",
+                )
+            except RetryExhausted:
+                expected_size = None
+            initialized.append(
+                _ManifestFile(
+                    file.position,
+                    file.local_name,
+                    file.resource_url,
+                    expected_size,
+                    "complete"
+                    if _file_has_size(final_path, expected_size)
+                    else "downloading",
+                )
+            )
+        return initialized
 
     def _download_file_attempt(self, file, part_path):
         if os.path.exists(part_path):

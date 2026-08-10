@@ -20,6 +20,7 @@ from creator_sync import (
     CloudflareBlocked,
     CreatorSync,
     FanboxTimeout,
+    PostDetail,
     RetryableFanboxError,
 )
 
@@ -243,6 +244,23 @@ def _response_retry_after(headers):
     return headers.get("retry-after") or headers.get("Retry-After")
 
 
+def _raise_file_access_error(response, operation):
+    status = response.status_code
+    if status == 403:
+        response_text = str(getattr(response, "text", "") or "")
+        if "block_ip" in response_text or "challenge" in response_text.lower():
+            raise CloudflareBlocked(f"{operation}时被 Cloudflare 拦截")
+    if status in (401, 403):
+        raise AuthenticationError("登录失效或账号未授权，请更新 FANBOX_COOKIE")
+    if status == 429:
+        retry_after = _response_retry_after(getattr(response, "headers", None))
+        raise RetryableFanboxError(
+            f"{operation}被限流", retry_after=retry_after
+        )
+    if status == 408 or status >= 500:
+        raise RetryableFanboxError(f"{operation} HTTP {status}")
+
+
 def _api_get_once(url):
     try:
         result = browser_fetch(url)
@@ -288,6 +306,15 @@ class Fanbox:
             raise RetryableFanboxError(f"Fanbox API 响应缺少有效的 {field} 列表")
         return body[field]
 
+    @staticmethod
+    def _is_restricted(post):
+        value = post.get("isRestricted", False)
+        if not isinstance(value, bool):
+            raise RetryableFanboxError(
+                "Fanbox API 响应包含无效的 isRestricted 标志"
+            )
+        return value
+
     def author_pages(self, creator):
         body = _api_get_once(
             "https://api.fanbox.cc/post.paginateCreator?creatorId=" + creator
@@ -299,11 +326,10 @@ class Fanbox:
 
     def page_posts(self, page_url):
         posts = self._required_list(_api_get_once(page_url), "posts")
-        if any(
-            not isinstance(post, dict) or not post.get("id")
-            for post in posts
-        ):
-            raise RetryableFanboxError("Fanbox API 响应包含无效的帖子条目")
+        for post in posts:
+            if not isinstance(post, dict) or not post.get("id"):
+                raise RetryableFanboxError("Fanbox API 响应包含无效的帖子条目")
+            self._is_restricted(post)
         return posts
 
     def post_detail(self, post_id):
@@ -311,7 +337,12 @@ class Fanbox:
             post = _api_get_once(
                 f"https://api.fanbox.cc/post.info?postId={post_id}"
             )["post"]
-            return post.get("title") or post_id, extract_post_files(post)
+            is_restricted = self._is_restricted(post)
+            return PostDetail(
+                post.get("title") or post_id,
+                [] if is_restricted else extract_post_files(post),
+                is_restricted,
+            )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
             raise RetryableFanboxError(
                 "Fanbox API post response is malformed"
@@ -324,27 +355,38 @@ class Fanbox:
             response = sess().get(url, impersonate=IMPERSONATE, stream=True, timeout=60)
         except Exception as exc:
             raise RetryableFanboxError(str(exc)) from exc
-        if response.status_code == 403 and (
-            "block_ip" in response.text or "challenge" in response.text.lower()
-        ):
-            raise CloudflareBlocked("下载文件时被 Cloudflare 拦截")
-        if response.status_code in (401, 403):
-            raise AuthenticationError("登录失效或账号未授权，请更新 FANBOX_COOKIE")
-        if response.status_code == 429:
-            retry_after = _response_retry_after(getattr(response, "headers", None))
-            raise RetryableFanboxError(
-                "Fanbox file request was rate limited", retry_after=retry_after
-            )
-        if response.status_code >= 500:
-            raise RetryableFanboxError(
-                f"Fanbox file request HTTP {response.status_code}"
-            )
+        _raise_file_access_error(response, "下载文件")
         response.raise_for_status()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as fp:
             for chunk in response.iter_content(1 << 16):
                 fp.write(chunk)
         return True
+
+    def file_size(self, url):
+        try:
+            response = sess().head(
+                url,
+                impersonate=IMPERSONATE,
+                headers={"Accept-Encoding": "identity"},
+                allow_redirects=True,
+                timeout=60,
+            )
+        except Exception as exc:
+            raise RetryableFanboxError(str(exc)) from exc
+        _raise_file_access_error(response, "查询文件大小")
+        if response.status_code != 200:
+            return None
+        headers = getattr(response, "headers", None) or {}
+        value = headers.get("content-length") or headers.get("Content-Length")
+        value = str(value).strip() if value is not None else ""
+        if not value.isascii() or not value.isdecimal():
+            return None
+        try:
+            size = int(value)
+        except ValueError:
+            return None
+        return size if size <= (1 << 63) - 1 else None
 
     def close(self):
         close_browser()
