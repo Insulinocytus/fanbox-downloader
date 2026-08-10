@@ -1,9 +1,9 @@
-import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from collections import deque
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from io import StringIO
 from unittest.mock import patch
@@ -94,6 +94,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(config["cookie"], "test-cookie")
         self.assertEqual(config["creators"], ["creator-a", "creator-b"])
         self.assertEqual(config["download_directory"], "/data/downloads")
+        self.assertEqual(config["state_directory"], "/data/downloads")
         self.assertEqual(config["file_delay"], 0.0)
         self.assertEqual(config["post_delay"], 10.0)
         self.assertEqual(config["timezone"].key, "Asia/Shanghai")
@@ -268,6 +269,20 @@ class FanboxAdapterTests(unittest.TestCase):
 
         self.assertEqual(posts, [{"id": "1"}])
 
+    def test_pagination_rejects_missing_or_invalid_lists(self):
+        for body, operation in [
+            ({}, lambda fanbox: fanbox.author_pages("creator")),
+            ({"pageUrls": None}, lambda fanbox: fanbox.author_pages("creator")),
+            ({}, lambda fanbox: fanbox.page_posts("page-1")),
+            ({"posts": {}}, lambda fanbox: fanbox.page_posts("page-1")),
+            ({"posts": [{}]}, lambda fanbox: fanbox.page_posts("page-1")),
+            ({"pageUrls": [None]}, lambda fanbox: fanbox.author_pages("creator")),
+        ]:
+            with self.subTest(body=body), patch.object(
+                fanbox_dl, "_api_get_once", return_value=body
+            ), self.assertRaises(RetryableFanboxError):
+                operation(Fanbox())
+
     def test_metadata_operation_classifies_failures(self):
         cases = [
             ({"status": 0, "text": "AbortError"}, FanboxTimeout),
@@ -341,19 +356,65 @@ class FanboxAdapterTests(unittest.TestCase):
         )
 
 
+def query_download_database(directory, query, parameters=()):
+    path = os.path.join(directory, creator_sync.DATABASE_FILE)
+    connection = sqlite3.connect(path)
+    try:
+        return list(connection.execute(query, parameters))
+    finally:
+        connection.close()
+
+
+def read_download_state(directory):
+    creators = dict(query_download_database(
+        directory, "SELECT creator_id, baseline_complete FROM creators"
+    ))
+    post_rows = query_download_database(
+        directory,
+        "SELECT creator_id, post_id, status, title, directory_path FROM posts",
+    )
+    posts = {
+        (creator, post_id): {
+            "status": status,
+            "title": title,
+            "directory_path": directory_path,
+        }
+        for creator, post_id, status, title, directory_path in post_rows
+    }
+    return creators, posts
+
+
+def read_manifest(directory, post_id):
+    rows = query_download_database(
+        directory,
+        """
+        SELECT position, local_name, resource_url, expected_size, phase
+        FROM files WHERE creator_id = 'creator' AND post_id = ?
+        ORDER BY position
+        """,
+        (post_id,),
+    )
+    return [
+        {
+            "position": position,
+            "local_name": local_name,
+            "resource_url": resource_url,
+            "expected_size": expected_size,
+            "phase": phase,
+        }
+        for position, local_name, resource_url, expected_size, phase in rows
+    ]
+
+
 class CreatorSyncTests(unittest.TestCase):
-    def test_complete_author_run_uses_one_interface(self):
+    def test_complete_baseline_persists_downloaded_empty_and_restricted_posts(self):
         file_url = "https://example/cover.jpg"
         named_url = "https://example/archive"
         fanbox = ScriptedFanbox(
             pages={"creator": ["page-1"]},
-            posts={
-                "page-1": [
-                    {"id": "1"},
-                    {"id": "2"},
-                    {"id": "3", "isRestricted": True},
-                ]
-            },
+            posts={"page-1": [
+                {"id": "1"}, {"id": "2"}, {"id": "3", "isRestricted": True},
+            ]},
             details={
                 "1": ("标题/:测试", [(file_url, ""), (named_url, "a:b.zip")]),
                 "2": ("空帖子", []),
@@ -363,38 +424,109 @@ class CreatorSyncTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
             CreatorSync(sync_config(root), fanbox).run()
-            state, valid = creator_sync._load_state(root)
+            creators, posts = read_download_state(root)
+            manifest = read_manifest(root, "1")
             post_dir = os.path.join(root, "creator", "1-标题__测试")
             with open(os.path.join(post_dir, "1_0.jpg"), "rb") as fp:
                 cover = fp.read()
             with open(os.path.join(post_dir, "1_1_a_b.zip"), "rb") as fp:
                 archive = fp.read()
 
-        self.assertTrue(valid)
-        self.assertEqual(cover, b"cover")
-        self.assertEqual(archive, b"archive")
+        self.assertEqual(creators, {"creator": 1})
+        self.assertEqual((cover, archive), (b"cover", b"archive"))
         self.assertEqual(
-            state["creators"]["creator"],
-            {
-                "initialized": True,
-                "posts": {"1": "downloaded", "2": "empty", "3": "restricted"},
-            },
+            {post_id: row["status"] for (_, post_id), row in posts.items()},
+            {"1": "downloaded", "2": "empty", "3": "restricted"},
         )
-        self.assertIn(("post_detail", "1"), fanbox.calls)
-        self.assertIn(("post_detail", "2"), fanbox.calls)
         self.assertNotIn(("post_detail", "3"), fanbox.calls)
         self.assertEqual(
-            [call for call in fanbox.calls if call[0] == "download_file"],
-            [("download_file", file_url), ("download_file", named_url)],
+            manifest,
+            [
+                {
+                    "position": 0,
+                    "local_name": "1_0.jpg",
+                    "resource_url": file_url,
+                    "expected_size": len(b"cover"),
+                    "phase": "complete",
+                },
+                {
+                    "position": 1,
+                    "local_name": "1_1_a_b.zip",
+                    "resource_url": named_url,
+                    "expected_size": len(b"archive"),
+                    "phase": "complete",
+                },
+            ],
         )
         self.assertTrue(fanbox.closed)
 
-    def test_fast_scan_stops_after_two_known_pages(self):
-        state = {
-            "version": 1,
-            "creators": {"creator": {"initialized": True, "posts": {"1": "empty", "2": "empty"}}},
-        }
+    def test_failed_baseline_page_is_persisted_and_full_scan_retries(self):
         fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1", "page-2"]},
+            posts={"page-1": [{"id": "1"}], "page-2": [{"id": "2"}]},
+            details={"1": ("one", []), "2": ("two", [])},
+            failures={("page_posts", "page-2"): [RuntimeError("failed page")]},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox)
+            sync.run()
+            first_creators, first_posts = read_download_state(root)
+            first_calls = list(fanbox.calls)
+            sync.run()
+            second_creators, second_posts = read_download_state(root)
+
+        self.assertEqual(first_creators, {"creator": 0})
+        self.assertEqual(first_posts[("creator", "1")]["status"], "downloading")
+        self.assertNotIn(("creator", "2"), first_posts)
+        self.assertFalse(any(call[0] == "post_detail" for call in first_calls))
+        self.assertEqual(second_creators, {"creator": 1})
+        self.assertEqual(
+            {post_id: row["status"] for (_, post_id), row in second_posts.items()},
+            {"1": "empty", "2": "empty"},
+        )
+        self.assertEqual(
+            [key for operation, key in fanbox.calls if operation == "page_posts"],
+            ["page-1", "page-2", "page-1", "page-2"],
+        )
+
+    def test_malformed_page_entry_skips_only_current_author(self):
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"], "second": ["second-page"]},
+            posts={"page-1": [{}], "second-page": []},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            config = sync_config(root, creators=["creator", "second"])
+            CreatorSync(config, fanbox).run()
+            creators, posts = read_download_state(root)
+
+        self.assertEqual(creators, {"creator": 0, "second": 1})
+        self.assertEqual(posts, {})
+        self.assertIn(("author_pages", "second"), fanbox.calls)
+
+    def test_post_detail_failure_does_not_revoke_successful_baseline(self):
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "1"}]},
+            details={"1": ("one", [])},
+            failures={("post_detail", "1"): [RuntimeError("detail failed")]},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            CreatorSync(sync_config(root), fanbox).run()
+            creators, posts = read_download_state(root)
+
+        self.assertEqual(creators, {"creator": 1})
+        self.assertEqual(posts[("creator", "1")]["status"], "downloading")
+
+    def test_incremental_scan_stops_after_two_fully_known_pages(self):
+        initial = ScriptedFanbox(
+            pages={"creator": ["old"]},
+            posts={"old": [{"id": "1"}, {"id": "2"}]},
+            details={"1": ("one", []), "2": ("two", [])},
+        )
+        incremental = ScriptedFanbox(
             pages={"creator": ["page-1", "page-2", "page-3"]},
             posts={
                 "page-1": [{"id": "1"}],
@@ -404,22 +536,23 @@ class CreatorSyncTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            creator_sync._save_state(root, state)
-            CreatorSync(sync_config(root), fanbox).run()
-            loaded, _ = creator_sync._load_state(root)
+            CreatorSync(sync_config(root), initial).run()
+            CreatorSync(sync_config(root), incremental).run()
+            _, posts = read_download_state(root)
 
         self.assertEqual(
-            [key for operation, key in fanbox.calls if operation == "page_posts"],
+            [key for operation, key in incremental.calls if operation == "page_posts"],
             ["page-1", "page-2"],
         )
-        self.assertNotIn("3", loaded["creators"]["creator"]["posts"])
+        self.assertNotIn(("creator", "3"), posts)
 
-    def test_unknown_pages_reset_known_page_overlap(self):
-        state = {
-            "version": 1,
-            "creators": {"creator": {"initialized": True, "posts": {"1": "empty", "2": "empty"}}},
-        }
-        fanbox = ScriptedFanbox(
+    def test_unknown_pages_reset_incremental_known_page_count(self):
+        initial = ScriptedFanbox(
+            pages={"creator": ["old"]},
+            posts={"old": [{"id": "1"}, {"id": "2"}]},
+            details={"1": ("one", []), "2": ("two", [])},
+        )
+        incremental = ScriptedFanbox(
             pages={"creator": ["page-1", "page-2", "page-3", "page-4", "page-5"]},
             posts={
                 "page-1": [{"id": "10"}],
@@ -428,100 +561,19 @@ class CreatorSyncTests(unittest.TestCase):
                 "page-4": [{"id": "2"}],
                 "page-5": [{"id": "12"}],
             },
-            details={"10": ("10", []), "11": ("11", [])},
+            details={"10": ("ten", []), "11": ("eleven", [])},
         )
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            creator_sync._save_state(root, state)
-            CreatorSync(sync_config(root), fanbox).run()
+            CreatorSync(sync_config(root), initial).run()
+            CreatorSync(sync_config(root), incremental).run()
 
         self.assertEqual(
-            [key for operation, key in fanbox.calls if operation == "page_posts"],
+            [key for operation, key in incremental.calls if operation == "page_posts"],
             ["page-1", "page-2", "page-3", "page-4"],
         )
-        self.assertEqual(
-            [key for operation, key in fanbox.calls if operation == "post_detail"],
-            ["10", "11"],
-        )
 
-    def test_failed_baseline_retries_full_scan(self):
-        url = "https://example/file.jpg"
-        fanbox = ScriptedFanbox(
-            pages={"creator": ["page-1", "page-2"]},
-            posts={"page-1": [{"id": "1"}], "page-2": [{"id": "2"}]},
-            details={"1": ("one", [(url, "")]), "2": ("two", [])},
-            content={url: b"file"},
-            failures={("download_file", url): [RuntimeError("failed")]},
-        )
-
-        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            sync = CreatorSync(sync_config(root), fanbox)
-            sync.run()
-            first, _ = creator_sync._load_state(root)
-            sync.run()
-            second, _ = creator_sync._load_state(root)
-
-        self.assertFalse(first["creators"]["creator"]["initialized"])
-        self.assertTrue(second["creators"]["creator"]["initialized"])
-        self.assertEqual(
-            [key for operation, key in fanbox.calls if operation == "page_posts"],
-            ["page-1", "page-2", "page-1", "page-2"],
-        )
-
-    def test_missing_download_directory_is_repaired_before_scan(self):
-        state = {
-            "version": 1,
-            "creators": {"creator": {"initialized": True, "posts": {"123": "downloaded"}}},
-        }
-        fanbox = ScriptedFanbox(
-            pages={"creator": []},
-            details={"123": ("title", [])},
-        )
-
-        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            creator_sync._save_state(root, state)
-            CreatorSync(sync_config(root), fanbox).run()
-
-        self.assertLess(
-            fanbox.calls.index(("post_detail", "123")),
-            fanbox.calls.index(("author_pages", "creator")),
-        )
-
-    def test_failed_directory_repair_is_retried_next_run(self):
-        url = "https://example/file.jpg"
-        state = {
-            "version": 1,
-            "creators": {
-                "creator": {
-                    "initialized": True,
-                    "posts": {"1": "empty", "2": "empty", "123": "downloaded"},
-                }
-            },
-        }
-        fanbox = ScriptedFanbox(
-            pages={"creator": ["page-1", "page-2", "page-3"]},
-            posts={
-                "page-1": [{"id": "1"}],
-                "page-2": [{"id": "2"}],
-                "page-3": [{"id": "123"}],
-            },
-            details={"123": ("title", [(url, "")])},
-            content={url: b"file"},
-            failures={("download_file", url): [RuntimeError("failed")]},
-        )
-
-        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            creator_sync._save_state(root, state)
-            sync = CreatorSync(sync_config(root), fanbox)
-            sync.run()
-            sync.run()
-            loaded, _ = creator_sync._load_state(root)
-
-        self.assertEqual(fanbox.calls.count(("download_file", url)), 2)
-        self.assertEqual(loaded["creators"]["creator"]["posts"]["123"], "downloaded")
-        self.assertTrue(loaded["creators"]["creator"]["initialized"])
-
-    def test_partial_download_retries_and_keeps_completed_file(self):
+    def test_partial_download_retries_without_reopening_the_baseline(self):
         first_url = "https://example/1.jpg"
         second_url = "https://example/2.jpg"
         fanbox = ScriptedFanbox(
@@ -535,38 +587,182 @@ class CreatorSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
             sync = CreatorSync(sync_config(root), fanbox)
             sync.run()
+            first_state = read_download_state(root)
             sync.run()
-            state, _ = creator_sync._load_state(root)
+            _, posts = read_download_state(root)
             post_dir = os.path.join(root, "creator", "123-title")
             with open(os.path.join(post_dir, "123_0.jpg"), "rb") as fp:
                 first = fp.read()
             with open(os.path.join(post_dir, "123_1.jpg"), "rb") as fp:
                 second = fp.read()
 
+        self.assertEqual(first_state[0], {"creator": 1})
+        self.assertEqual(first_state[1][("creator", "123")]["status"], "downloading")
         self.assertEqual((first, second), (b"one", b"two"))
-        self.assertEqual(fanbox.calls.count(("download_file", first_url)), 2)
-        self.assertEqual(fanbox.calls.count(("download_file", second_url)), 2)
-        self.assertEqual(state["creators"]["creator"]["posts"]["123"], "downloaded")
+        self.assertEqual(posts[("creator", "123")]["status"], "downloaded")
+
+    def test_missing_and_size_changed_files_repair_from_original_manifest(self):
+        first_url = "https://example/original-1.jpg"
+        second_url = "https://example/original-2.jpg"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={"123": ("title", [(first_url, ""), (second_url, "")])},
+            content={first_url: b"one", second_url: b"two"},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox)
+            sync.run()
+            post_dir = os.path.join(root, "creator", "123-title")
+            first_path = os.path.join(post_dir, "123_0.jpg")
+            second_path = os.path.join(post_dir, "123_1.jpg")
+            extra_path = os.path.join(post_dir, "notes.txt")
+
+            os.remove(first_path)
+            with open(extra_path, "wb") as fp:
+                fp.write(b"user file")
+            fanbox.details["123"] = (
+                "edited",
+                [("https://example/replacement.jpg", "")],
+            )
+            fanbox.calls.clear()
+            sync.run()
+            missing_repair_calls = list(fanbox.calls)
+
+            with open(second_path, "wb") as fp:
+                fp.write(b"truncated")
+            fanbox.calls.clear()
+            sync.run()
+            changed_repair_calls = list(fanbox.calls)
+
+            with open(first_path, "rb") as fp:
+                first = fp.read()
+            with open(second_path, "rb") as fp:
+                second = fp.read()
+            with open(extra_path, "rb") as fp:
+                extra = fp.read()
+
+        self.assertEqual(
+            [call for call in missing_repair_calls if call[0] == "download_file"],
+            [("download_file", first_url)],
+        )
+        self.assertEqual(
+            [call for call in changed_repair_calls if call[0] == "download_file"],
+            [("download_file", second_url)],
+        )
+        self.assertFalse(any(call[0] == "post_detail" for call in missing_repair_calls))
+        self.assertFalse(any(call[0] == "post_detail" for call in changed_repair_calls))
+        self.assertEqual((first, second, extra), (b"one", b"two", b"user file"))
+
+    def test_interrupted_transfer_leaves_only_part_and_restarts_from_zero(self):
+        url = "https://example/file.jpg"
+
+        class InterruptingFanbox(ScriptedFanbox):
+            interrupted = False
+
+            def download_file(self, resource_url, path):
+                self._call("download_file", resource_url)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if not self.interrupted:
+                    self.interrupted = True
+                    with open(path, "wb") as fp:
+                        fp.write(b"partial")
+                    raise RuntimeError("interrupted")
+                with open(path, "wb") as fp:
+                    fp.write(self.content[resource_url])
+                return True
+
+        fanbox = InterruptingFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={"123": ("title", [(url, "")])},
+            content={url: b"complete bytes"},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox)
+            sync.run()
+            post_dir = os.path.join(root, "creator", "123-title")
+            final_path = os.path.join(post_dir, "123_0.jpg")
+            part_path = final_path + ".part"
+            first_manifest = read_manifest(root, "123")
+            first_files = (os.path.exists(final_path), os.path.exists(part_path))
+
+            sync.run()
+            second_manifest = read_manifest(root, "123")
+            with open(final_path, "rb") as fp:
+                completed = fp.read()
+
+        self.assertEqual(first_files, (False, True))
+        self.assertEqual(first_manifest[0]["phase"], "downloading")
+        self.assertEqual(second_manifest[0]["phase"], "complete")
+        self.assertEqual(completed, b"complete bytes")
+
+    def test_staged_part_is_promoted_without_redownloading(self):
+        url = "https://example/file.jpg"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={"123": ("title", [(url, "")])},
+            content={url: b"file bytes"},
+        )
+        original_replace = os.replace
+        interrupted = False
+
+        def interrupt_first_promotion(source, target):
+            nonlocal interrupted
+            if source.endswith(".part") and not interrupted:
+                interrupted = True
+                raise OSError("rename interrupted")
+            return original_replace(source, target)
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox)
+            with patch("creator_sync.os.replace", side_effect=interrupt_first_promotion):
+                sync.run()
+            staged = read_manifest(root, "123")
+            calls_after_failure = fanbox.calls.count(("download_file", url))
+
+            sync.run()
+            completed = read_manifest(root, "123")
+            calls_after_recovery = fanbox.calls.count(("download_file", url))
+
+        self.assertEqual(staged[0]["phase"], "staged")
+        self.assertEqual(completed[0]["phase"], "complete")
+        self.assertEqual((calls_after_failure, calls_after_recovery), (1, 1))
 
 
-class StateTests(unittest.TestCase):
-    def test_state_round_trip_preserves_each_creator(self):
-        state = {
-            "version": 1,
-            "creators": {
-                "creator-a": {"initialized": True, "posts": {"1": "downloaded", "2": "empty"}},
-                "creator-b": {"initialized": False, "posts": {"3": "restricted"}},
-            },
-        }
+class StateDatabaseTests(unittest.TestCase):
+    def test_database_defaults_to_download_directory_and_uses_safe_pragmas(self):
+        fanbox = ScriptedFanbox(pages={"creator": []})
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            CreatorSync(sync_config(root), fanbox).run()
+            path = os.path.join(root, creator_sync.DATABASE_FILE)
+            database = creator_sync._DownloadState(path)
+            try:
+                pragmas = (
+                    database.connection.execute("PRAGMA journal_mode").fetchone()[0],
+                    database.connection.execute("PRAGMA synchronous").fetchone()[0],
+                    database.connection.execute("PRAGMA foreign_keys").fetchone()[0],
+                )
+            finally:
+                database.close()
 
-        with tempfile.TemporaryDirectory() as root:
-            creator_sync._save_state(root, state)
-            loaded, valid = creator_sync._load_state(root)
+        self.assertEqual(pragmas, ("delete", 2, 1))
 
-        self.assertTrue(valid)
-        self.assertEqual(loaded, state)
+    def test_state_directory_moves_only_the_database(self):
+        fanbox = ScriptedFanbox(pages={"creator": []})
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as state:
+            config = sync_config(root)
+            config["state_directory"] = state
+            with redirect_stdout(StringIO()):
+                CreatorSync(config, fanbox).run()
 
-    def test_invalid_state_is_rebuilt_by_sync(self):
+            self.assertTrue(os.path.isfile(os.path.join(state, creator_sync.DATABASE_FILE)))
+            self.assertFalse(os.path.exists(os.path.join(root, creator_sync.DATABASE_FILE)))
+
+    def test_legacy_json_is_silently_ignored(self):
         fanbox = ScriptedFanbox(pages={"creator": []})
         with tempfile.TemporaryDirectory() as root:
             with open(os.path.join(root, ".fanbox-state.json"), "w", encoding="utf-8") as fp:
@@ -574,44 +770,39 @@ class StateTests(unittest.TestCase):
             output = StringIO()
             with redirect_stdout(output):
                 CreatorSync(sync_config(root), fanbox).run()
-            state, valid = creator_sync._load_state(root)
+            creators, _ = read_download_state(root)
 
-        self.assertTrue(valid)
-        self.assertTrue(state["creators"]["creator"]["initialized"])
-        self.assertIn("状态文件", output.getvalue())
+        self.assertEqual(creators, {"creator": 1})
+        self.assertNotIn("json", output.getvalue().lower())
+        self.assertNotIn("状态文件", output.getvalue())
 
-    def test_existing_directory_does_not_create_downloaded_record(self):
+    def test_corrupt_database_is_preserved_and_terminates(self):
+        fanbox = ScriptedFanbox()
+        corrupt = b"this is not sqlite"
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, creator_sync.DATABASE_FILE)
+            with open(path, "wb") as fp:
+                fp.write(corrupt)
+            errors = StringIO()
+            with redirect_stderr(errors), self.assertRaises(SystemExit) as exit_error:
+                CreatorSync(sync_config(root), fanbox).run()
+            with open(path, "rb") as fp:
+                after = fp.read()
+
+        self.assertEqual(exit_error.exception.code, 1)
+        self.assertEqual(after, corrupt)
+        self.assertIn("数据库不可用", errors.getvalue())
+        self.assertTrue(fanbox.closed)
+
+    def test_new_author_defaults_to_incomplete_when_listing_fails(self):
         fanbox = ScriptedFanbox(
-            pages={"creator": ["page-1"]},
-            posts={"page-1": [{"id": "123"}]},
-            details={"123": ("new-title", [])},
+            failures={("author_pages", "creator"): [RuntimeError("failed")]}
         )
-
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            os.makedirs(os.path.join(root, "creator", "123-old-title"))
             CreatorSync(sync_config(root), fanbox).run()
-            state, _ = creator_sync._load_state(root)
+            creators, _ = read_download_state(root)
 
-        self.assertEqual(state["creators"]["creator"]["posts"]["123"], "empty")
-
-    def test_save_state_replaces_a_temporary_file_atomically(self):
-        state = {"version": 1, "creators": {}}
-        calls = []
-
-        with tempfile.TemporaryDirectory() as root, patch(
-            "creator_sync.os.replace",
-            side_effect=lambda source, target: (
-                calls.append((source, target)), os.rename(source, target)
-            )[-1],
-        ):
-            creator_sync._save_state(root, state)
-            with open(os.path.join(root, ".fanbox-state.json"), encoding="utf-8") as fp:
-                saved = json.load(fp)
-
-        self.assertEqual(saved, state)
-        self.assertEqual(len(calls), 1)
-        self.assertNotEqual(calls[0][0], calls[0][1])
-        self.assertTrue(calls[0][0].endswith(".tmp"))
+        self.assertEqual(creators, {"creator": 0})
 
 
 if __name__ == "__main__":

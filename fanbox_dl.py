@@ -79,6 +79,12 @@ def read_config(env=None):
     if not os.path.isabs(download_directory) and not download_directory.startswith("/"):
         download_directory = os.path.abspath(download_directory)
 
+    state_directory = env.get("FANBOX_STATE_DIRECTORY", "").strip()
+    if not state_directory:
+        state_directory = download_directory
+    elif not os.path.isabs(state_directory) and not state_directory.startswith("/"):
+        state_directory = os.path.abspath(state_directory)
+
     def read_delay(name, default):
         raw = env.get(name, str(default))
         try:
@@ -107,6 +113,7 @@ def read_config(env=None):
         "cookie": cookie,
         "creators": creators,
         "download_directory": download_directory,
+        "state_directory": state_directory,
         "file_delay": read_delay("FANBOX_FILE_DELAY", 0),
         "post_delay": read_delay("FANBOX_POST_DELAY", 10),
         "timezone": timezone,
@@ -240,14 +247,29 @@ def _api_get_once(url):
 class Fanbox:
     """每次调用只执行一个 Fanbox 领域操作的生产适配器。"""
 
+    @staticmethod
+    def _required_list(body, field):
+        if not isinstance(body, dict) or not isinstance(body.get(field), list):
+            raise RetryableFanboxError(f"Fanbox API 响应缺少有效的 {field} 列表")
+        return body[field]
+
     def author_pages(self, creator):
         body = _api_get_once(
             "https://api.fanbox.cc/post.paginateCreator?creatorId=" + creator
         )
-        return body.get("pageUrls", [])
+        pages = self._required_list(body, "pageUrls")
+        if any(not isinstance(page, str) or not page for page in pages):
+            raise RetryableFanboxError("Fanbox API 响应包含无效的分页 URL")
+        return pages
 
     def page_posts(self, page_url):
-        return _api_get_once(page_url).get("posts", [])
+        posts = self._required_list(_api_get_once(page_url), "posts")
+        if any(
+            not isinstance(post, dict) or not post.get("id")
+            for post in posts
+        ):
+            raise RetryableFanboxError("Fanbox API 响应包含无效的帖子条目")
+        return posts
 
     def post_detail(self, post_id):
         post = _api_get_once(f"https://api.fanbox.cc/post.info?postId={post_id}")["post"]

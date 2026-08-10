@@ -64,7 +64,9 @@ FAKE_ROOT_MODE=1 \
 PUID=3000 \
 PGID=3000 \
 IDENTITY_FILE="$root/identity" \
+FANBOX_STATE_DIRECTORY="$root/state" \
 HOME="$root/home" \
 "$root/entrypoint.sh" python -c 'ignored'
 
 test "$(cat "$root/identity")" = "3000:3000"
+test -d "$root/state"

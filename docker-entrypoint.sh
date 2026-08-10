@@ -8,6 +8,7 @@ die() {
 
 PUID=${PUID-10001}
 PGID=${PGID-10001}
+FANBOX_STATE_DIRECTORY=${FANBOX_STATE_DIRECTORY:-/data/downloads}
 
 case "$PUID" in
     ''|*[!0-9]*) die "PUID must be a positive integer" ;;
@@ -47,7 +48,10 @@ fi
 [ "$(id -g appuser)" -eq "$PGID" ] \
     || die "appuser GID does not match PGID"
 
-chown -R appuser:appgroup /data/downloads /opt/cloakbrowser-cache /home/appuser \
+mkdir -p "$FANBOX_STATE_DIRECTORY" \
+    || die "could not create FANBOX_STATE_DIRECTORY"
+
+chown -R appuser:appgroup /data/downloads "$FANBOX_STATE_DIRECTORY" /opt/cloakbrowser-cache /home/appuser \
     || die "could not initialize writable directory ownership"
 
 export HOME=/home/appuser
