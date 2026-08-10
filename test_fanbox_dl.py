@@ -992,6 +992,50 @@ class CreatorSyncTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "post_detail" for call in changed_repair_calls))
         self.assertEqual((first, second, extra), (b"one", b"two", b"user file"))
 
+    def test_failed_repair_skips_current_post_and_repairs_older_post(self):
+        failed_url = "https://example/failed.jpg"
+        skipped_url = "https://example/skipped.jpg"
+        repaired_url = "https://example/repaired.jpg"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "200"}, {"id": "100"}]},
+            details={
+                "200": ("newer", [(failed_url, ""), (skipped_url, "")]),
+                "100": ("older", [(repaired_url, "")]),
+            },
+            content={
+                failed_url: b"failed",
+                skipped_url: b"skipped",
+                repaired_url: b"repaired",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep)
+            sync.run()
+            shutil.rmtree(os.path.join(root, "creator", "200-newer"))
+            shutil.rmtree(os.path.join(root, "creator", "100-older"))
+            os.makedirs(os.path.join(root, "creator", "200-newer"))
+            os.makedirs(os.path.join(root, "creator", "100-older"))
+            fanbox.failures[("download_file", failed_url)] = deque(
+                [RuntimeError("source expired")]
+            )
+            fanbox.calls.clear()
+
+            with self.assertLogs("creator_sync", level="WARNING") as logs:
+                sync.run()
+            _, posts = read_download_state(root)
+
+        self.assertEqual(
+            [key for operation, key in fanbox.calls if operation == "download_file"],
+            [failed_url, repaired_url],
+        )
+        self.assertEqual(posts[("creator", "200")]["status"], "downloading")
+        self.assertEqual(posts[("creator", "100")]["status"], "downloaded")
+        repair_failure = "\n".join(logs.output)
+        self.assertIn("source expired", repair_failure)
+        self.assertIn("outcome=partial", repair_failure)
+
     def test_repair_detail_exhaustion_skips_author_and_continues(self):
         url = "https://example/repair.jpg"
         fanbox = ScriptedFanbox(

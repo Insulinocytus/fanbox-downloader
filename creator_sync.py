@@ -1067,6 +1067,7 @@ class CreatorSync:
                     final_path,
                     exc,
                 )
+                break
             finally:
                 self.sleep_fn(self.file_delay)
 
