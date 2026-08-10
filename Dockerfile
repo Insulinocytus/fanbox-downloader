@@ -46,7 +46,7 @@ RUN uv sync --locked --no-dev \
     && mkdir -p /opt/cloakbrowser-cache \
     && /app/.venv/bin/python -m cloakbrowser install
 
-COPY fanbox_dl.py .
+COPY fanbox_dl.py creator_sync.py .
 
 RUN groupadd --gid 10001 appgroup \
     && useradd --create-home --uid 10001 --gid appgroup appuser \
