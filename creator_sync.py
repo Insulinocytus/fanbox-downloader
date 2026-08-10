@@ -733,12 +733,7 @@ class CreatorSync:
     def _download_file_attempt(self, file, part_path):
         if os.path.exists(part_path):
             os.remove(part_path)
-        try:
-            created = self.fanbox.download_file(file.resource_url, part_path)
-        except (CloudflareBlocked, RetryableFanboxError):
-            raise
-        except Exception as exc:
-            raise RetryableFanboxError(str(exc)) from exc
+        created = self.fanbox.download_file(file.resource_url, part_path)
         if not created or not os.path.isfile(part_path):
             raise RetryableFanboxError("download did not produce a file")
         actual_size = os.path.getsize(part_path)

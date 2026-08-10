@@ -637,6 +637,22 @@ class CreatorSyncTests(unittest.TestCase):
             ["page-1", "page-2", "page-3", "page-4"],
         )
 
+    def test_permanent_file_error_is_attempted_once(self):
+        url = "https://example/missing.jpg"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={"123": ("title", [(url, "")])},
+            failures={("download_file", url): [RuntimeError("HTTP 404")]},
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep).run()
+            _, posts = read_download_state(root)
+
+        self.assertEqual(fanbox.calls.count(("download_file", url)), 1)
+        self.assertEqual(posts[("creator", "123")]["status"], "downloading")
+
     def test_partial_download_retries_without_reopening_the_baseline(self):
         first_url = "https://example/1.jpg"
         second_url = "https://example/2.jpg"
@@ -764,7 +780,7 @@ class CreatorSyncTests(unittest.TestCase):
                 if self.attempts <= 4:
                     with open(path, "wb") as fp:
                         fp.write(b"partial")
-                    raise RuntimeError("interrupted")
+                    raise RetryableFanboxError("interrupted")
                 with open(path, "wb") as fp:
                     fp.write(self.content[resource_url])
                 return True
