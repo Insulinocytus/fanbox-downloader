@@ -601,6 +601,9 @@ class CreatorSync:
         logger.info("operation=sync_author author=%s", creator)
         database.ensure_creator(creator)
         baseline_complete = database.baseline_complete(creator)
+        existing_pending_ids = {
+            str(post["id"]) for post in database.pending_posts(creator)
+        }
         total_new = 0
         partial = False
 
@@ -661,7 +664,13 @@ class CreatorSync:
         if not baseline_complete:
             database.complete_baseline(creator)
 
-        for post in database.pending_posts(creator):
+        pending_posts = database.pending_posts(creator)
+        ordered_posts = [
+            post for post in pending_posts if str(post["id"]) not in existing_pending_ids
+        ] + [
+            post for post in pending_posts if str(post["id"]) in existing_pending_ids
+        ]
+        for post in ordered_posts:
             post_id = str(post["id"])
             logger.info("operation=process_post author=%s post=%s", creator, post_id)
             try:

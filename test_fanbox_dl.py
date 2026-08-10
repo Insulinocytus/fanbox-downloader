@@ -908,6 +908,36 @@ class CreatorSyncTests(unittest.TestCase):
         self.assertEqual(posts[("creator", "124")]["status"], "downloaded")
         self.assertEqual(posts[("creator", "123")]["status"], "downloaded")
 
+    def test_new_posts_download_before_existing_incomplete_posts(self):
+        old_url = "https://example/old.jpg"
+        new_url = "https://example/new.jpg"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["initial"]},
+            posts={"initial": [{"id": "200"}]},
+            details={
+                "200": ("old", [(old_url, "")]),
+                "100": ("new", [(new_url, "")]),
+            },
+            content={old_url: b"old", new_url: b"new"},
+            failures={
+                ("download_file", old_url): retry_failures("try next run")
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep)
+            sync.run()
+
+            fanbox.pages["creator"] = ["incremental"]
+            fanbox.posts["incremental"] = [{"id": "100"}, {"id": "200"}]
+            fanbox.calls.clear()
+            sync.run()
+
+        self.assertEqual(
+            [key for operation, key in fanbox.calls if operation == "download_file"],
+            [new_url, old_url],
+        )
+
     def test_missing_and_size_changed_files_repair_from_original_manifest(self):
         first_url = "https://example/original-1.jpg"
         second_url = "https://example/original-2.jpg"
@@ -1073,6 +1103,62 @@ class CreatorSyncTests(unittest.TestCase):
         self.assertEqual(completed[0]["phase"], "complete")
         self.assertEqual((calls_after_failure, calls_after_recovery), (1, 1))
         self.assertIn("operation=atomic_rename", "\n".join(recovery_logs.output))
+
+    def test_recovery_uses_file_phase_and_exact_on_disk_state(self):
+        urls = [f"https://example/{index}.bin" for index in range(4)]
+        contents = {url: f"content-{index}".encode() for index, url in enumerate(urls)}
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "123"}]},
+            details={"123": ("title", [(url, "") for url in urls])},
+            content=contents,
+        )
+
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep)
+            sync.run()
+            post_dir = os.path.join(root, "creator", "123-title")
+            paths = [os.path.join(post_dir, f"123_{index}.bin") for index in range(4)]
+
+            connection = sqlite3.connect(os.path.join(root, creator_sync.DATABASE_FILE))
+            try:
+                with connection:
+                    connection.execute(
+                        "UPDATE posts SET status = 'downloading' WHERE post_id = '123'"
+                    )
+                    connection.executemany(
+                        "UPDATE files SET phase = ? WHERE post_id = '123' AND position = ?",
+                        [("staged", 0), ("complete", 1), ("complete", 2), ("staged", 3)],
+                    )
+            finally:
+                connection.close()
+
+            for path in paths[:2]:
+                with open(path + ".part", "wb") as fp:
+                    fp.write(b"stale")
+            for index in (2, 3):
+                os.remove(paths[index])
+            with open(paths[2] + ".part", "wb") as fp:
+                fp.write(contents[urls[2]])
+            with open(paths[3] + ".part", "wb") as fp:
+                fp.write(b"wrong")
+
+            fanbox.calls.clear()
+            sync.run()
+            manifest = read_manifest(root, "123")
+            recovered = []
+            for path in paths:
+                with open(path, "rb") as fp:
+                    recovered.append(fp.read())
+            parts_removed = all(not os.path.exists(path + ".part") for path in paths)
+
+        self.assertEqual(
+            [key for operation, key in fanbox.calls if operation == "download_file"],
+            urls[2:],
+        )
+        self.assertEqual(recovered, [contents[url] for url in urls])
+        self.assertTrue(all(row["phase"] == "complete" for row in manifest))
+        self.assertTrue(parts_removed)
 
 
 class StateDatabaseTests(unittest.TestCase):
