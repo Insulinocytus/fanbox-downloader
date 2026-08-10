@@ -7,15 +7,14 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
+from enum import StrEnum
 
 DATABASE_FILE = ".fanbox-state.sqlite3"
 SCHEMA_VERSION = "1"
 POST_STATES = {"downloading", "downloaded", "empty", "restricted"}
 MAX_ATTEMPTS = 4
-RETRY = MAX_ATTEMPTS
 RETRY_WAITS = (10, 30, 60)
 API_DELAY = 1.0
-CLOUDFLARE_WAITS = (30, 60, 120, 300)
 
 
 class RetryableFanboxError(RuntimeError):
@@ -33,6 +32,11 @@ class CloudflareBlocked(RuntimeError):
     """Fanbox 明确报告 Cloudflare 拦截。"""
 
 
+class RetryScope(StrEnum):
+    AUTHOR = "author"
+    FILE = "file"
+
+
 class StateDatabaseError(RuntimeError):
     """下载记录数据库无法安全使用。"""
 
@@ -40,7 +44,7 @@ class StateDatabaseError(RuntimeError):
 class RetryExhausted(RuntimeError):
     """A remote operation failed on all configured attempts."""
 
-    def __init__(self, scope, operation, attempts, cause):
+    def __init__(self, scope: RetryScope, operation, attempts, cause):
         self.scope = scope
         self.operation = operation
         self.attempts = attempts
@@ -48,6 +52,10 @@ class RetryExhausted(RuntimeError):
         super().__init__(
             f"{operation} failed after {attempts} attempts: {cause}"
         )
+
+    @property
+    def skips_author(self):
+        return self.scope is not RetryScope.FILE
 
 
 @dataclass(frozen=True)
@@ -533,13 +541,17 @@ class CreatorSync:
                 return False
             except RetryExhausted as exc:
                 print(f"\n  {exc}")
-                if exc.scope != "file":
+                if exc.skips_author:
                     return True
                 continue
             if result is not None:
                 total_new += result.downloaded_file_count
 
-        repair_ok, repaired = self._repair_downloads(database, creator)
+        try:
+            repair_ok, repaired = self._repair_downloads(database, creator)
+        except RetryExhausted as exc:
+            print(f"  {exc}")
+            return True
         total_new += repaired
         if not repair_ok:
             return False
@@ -613,8 +625,8 @@ class CreatorSync:
                 return False, downloaded_file_count
             except RetryExhausted as exc:
                 print(f"  {exc}")
-                if exc.scope != "file":
-                    return False, downloaded_file_count
+                if exc.skips_author:
+                    raise
                 continue
             if result is not None:
                 downloaded_file_count += result.downloaded_file_count
@@ -635,7 +647,7 @@ class CreatorSync:
             except (TypeError, ValueError, OverflowError):
                 return None
 
-    def _retry(self, operation, *, scope, operation_name):
+    def _retry(self, operation, *, scope: RetryScope, operation_name):
         """Run one remote operation with the shared ordinary-failure policy."""
         last_error = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -669,7 +681,7 @@ class CreatorSync:
 
     def _metadata(self, operation):
         return self._retry(
-            operation, scope="author", operation_name="metadata"
+            operation, scope=RetryScope.AUTHOR, operation_name="metadata"
         )
 
     def _process_post(self, database, key, post):
@@ -735,7 +747,7 @@ class CreatorSync:
 
                 actual_size = self._retry(
                     lambda: self._download_file_attempt(file, part_path),
-                    scope="file",
+                    scope=RetryScope.FILE,
                     operation_name=f"download_file:{file.resource_url}",
                 )
 
