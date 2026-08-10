@@ -15,6 +15,7 @@ POST_STATES = {"downloading", "downloaded", "empty", "restricted"}
 MAX_ATTEMPTS = 4
 RETRY_WAITS = (10, 30, 60)
 API_DELAY = 1.0
+CLOUDFLARE_WAITS = (30, 60, 120, 300)
 
 
 class RetryableFanboxError(RuntimeError):
@@ -81,12 +82,13 @@ class _ManifestFile:
     phase: str
 
 
-def wait_with_progress(seconds):
+def wait_with_progress(seconds, sleep_fn=None):
+    sleep_fn = sleep_fn or time.sleep
     remaining = int(seconds)
     while remaining > 0:
         print(f"  Cloudflare 冷却中,剩余约 {remaining} 秒", flush=True)
         wait = min(10, remaining)
-        time.sleep(wait)
+        sleep_fn(wait)
         remaining -= wait
 
 
@@ -657,7 +659,7 @@ class CreatorSync:
                 raise
             except (sqlite3.Error, StateDatabaseError):
                 raise
-            except Exception as exc:
+            except RetryableFanboxError as exc:
                 last_error = exc
                 if attempt >= MAX_ATTEMPTS:
                     raise RetryExhausted(
@@ -680,9 +682,22 @@ class CreatorSync:
         raise RetryExhausted(scope, operation_name, MAX_ATTEMPTS, last_error)
 
     def _metadata(self, operation):
-        return self._retry(
-            operation, scope=RetryScope.AUTHOR, operation_name="metadata"
-        )
+        for attempt in range(1, len(CLOUDFLARE_WAITS) + 2):
+            try:
+                return self._retry(
+                    operation,
+                    scope=RetryScope.AUTHOR,
+                    operation_name="metadata",
+                )
+            except CloudflareBlocked:
+                if attempt > len(CLOUDFLARE_WAITS):
+                    raise
+                wait = CLOUDFLARE_WAITS[attempt - 1]
+                print(
+                    f"  Cloudflare temporary block; retrying in {wait}s",
+                    flush=True,
+                )
+                wait_with_progress(wait, self.sleep_fn)
 
     def _process_post(self, database, key, post):
         post_id = str(post["id"])
@@ -718,12 +733,17 @@ class CreatorSync:
     def _download_file_attempt(self, file, part_path):
         if os.path.exists(part_path):
             os.remove(part_path)
-        created = self.fanbox.download_file(file.resource_url, part_path)
+        try:
+            created = self.fanbox.download_file(file.resource_url, part_path)
+        except (CloudflareBlocked, RetryableFanboxError):
+            raise
+        except Exception as exc:
+            raise RetryableFanboxError(str(exc)) from exc
         if not created or not os.path.isfile(part_path):
-            raise RuntimeError("download did not produce a file")
+            raise RetryableFanboxError("download did not produce a file")
         actual_size = os.path.getsize(part_path)
         if file.expected_size is not None and actual_size != file.expected_size:
-            raise RuntimeError(
+            raise RetryableFanboxError(
                 f"download size {actual_size} does not match expected "
                 f"{file.expected_size}"
             )

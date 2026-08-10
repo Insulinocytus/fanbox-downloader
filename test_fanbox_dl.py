@@ -84,7 +84,7 @@ def no_sleep(_seconds):
 
 
 def retry_failures(message):
-    return [RuntimeError(message)] * creator_sync.MAX_ATTEMPTS
+    return [RetryableFanboxError(message)] * creator_sync.MAX_ATTEMPTS
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -312,6 +312,19 @@ class FanboxAdapterTests(unittest.TestCase):
         ), self.assertRaises(SystemExit):
             Fanbox().page_posts("page-1")
 
+        with patch.object(
+            fanbox_dl, "browser_fetch", return_value={"status": 404, "text": "missing"}
+        ), self.assertRaises(RuntimeError) as error:
+            Fanbox().page_posts("page-1")
+        self.assertNotIsInstance(error.exception, RetryableFanboxError)
+
+        with patch.object(
+            fanbox_dl,
+            "browser_fetch",
+            return_value={"status": 200, "text": '{"body": {}}'},
+        ), self.assertRaises(RetryableFanboxError):
+            Fanbox().post_detail("1")
+
     def test_file_operation_uses_curl_and_writes_bytes(self):
         class Response:
             status_code = 200
@@ -358,6 +371,32 @@ class FanboxAdapterTests(unittest.TestCase):
 
         self.assertEqual(fanbox.calls.count(("author_pages", "creator")), 4)
         self.assertEqual(waits, [10, 30, 60])
+
+    def test_cloudflare_metadata_uses_special_cooling_retry(self):
+        waits = []
+        fanbox = ScriptedFanbox(
+            pages={"creator": []},
+            failures={
+                ("author_pages", "creator"): [
+                    CloudflareBlocked("blocked"),
+                    None,
+                ]
+            },
+        )
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            CreatorSync(sync_config(root), fanbox, sleep_fn=waits.append).run()
+
+        self.assertEqual(fanbox.calls.count(("author_pages", "creator")), 2)
+        self.assertEqual(sum(waits), 30)
+
+    def test_nonretryable_operation_is_attempted_once(self):
+        fanbox = ScriptedFanbox(
+            failures={("author_pages", "creator"): [RuntimeError("permanent")]},
+        )
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+            CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep).run()
+
+        self.assertEqual(fanbox.calls.count(("author_pages", "creator")), 1)
 
     def test_cloudflare_wait_prints_progress_every_ten_seconds(self):
         output = StringIO()

@@ -252,8 +252,12 @@ def _api_get_once(url):
             f"Fanbox API HTTP 429: {response_text[:200]}",
             retry_after=retry_after,
         )
-    if status != 200:
+    if status == 408 or status >= 500:
         raise RetryableFanboxError(
+            f"Fanbox API HTTP {status}: {response_text[:200]}"
+        )
+    if status != 200:
+        raise RuntimeError(
             f"Fanbox API HTTP {status}: {response_text[:200]}"
         )
     try:
@@ -290,8 +294,15 @@ class Fanbox:
         return posts
 
     def post_detail(self, post_id):
-        post = _api_get_once(f"https://api.fanbox.cc/post.info?postId={post_id}")["post"]
-        return post.get("title") or post_id, extract_post_files(post)
+        try:
+            post = _api_get_once(
+                f"https://api.fanbox.cc/post.info?postId={post_id}"
+            )["post"]
+            return post.get("title") or post_id, extract_post_files(post)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise RetryableFanboxError(
+                "Fanbox API post response is malformed"
+            ) from exc
 
     def download_file(self, url, path):
         if os.path.exists(path):
