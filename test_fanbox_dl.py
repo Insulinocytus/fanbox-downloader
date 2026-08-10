@@ -337,7 +337,7 @@ class FanboxAdapterTests(unittest.TestCase):
             CreatorSync(sync_config(root), fanbox).run()
 
         self.assertEqual(fanbox.calls.count(("author_pages", "creator")), 2)
-        sleep.assert_any_call(2)
+        sleep.assert_any_call(10)
 
     def test_cloudflare_wait_prints_progress_every_ten_seconds(self):
         output = StringIO()
@@ -465,11 +465,11 @@ class CreatorSyncTests(unittest.TestCase):
             pages={"creator": ["page-1", "page-2"]},
             posts={"page-1": [{"id": "1"}], "page-2": [{"id": "2"}]},
             details={"1": ("one", []), "2": ("two", [])},
-            failures={("page_posts", "page-2"): [RuntimeError("failed page")]},
+            failures={("page_posts", "page-2"): [RuntimeError("failed page")] * 4},
         )
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            sync = CreatorSync(sync_config(root), fanbox)
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=lambda _: None)
             sync.run()
             first_creators, first_posts = read_download_state(root)
             first_calls = list(fanbox.calls)
@@ -487,7 +487,7 @@ class CreatorSyncTests(unittest.TestCase):
         )
         self.assertEqual(
             [key for operation, key in fanbox.calls if operation == "page_posts"],
-            ["page-1", "page-2", "page-1", "page-2"],
+            ["page-1", "page-2", "page-2", "page-2", "page-2", "page-1", "page-2"],
         )
 
     def test_malformed_page_entry_skips_only_current_author(self):
@@ -510,11 +510,11 @@ class CreatorSyncTests(unittest.TestCase):
             pages={"creator": ["page-1"]},
             posts={"page-1": [{"id": "1"}]},
             details={"1": ("one", [])},
-            failures={("post_detail", "1"): [RuntimeError("detail failed")]},
+            failures={("post_detail", "1"): [RuntimeError("detail failed")] * 4},
         )
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            CreatorSync(sync_config(root), fanbox).run()
+            CreatorSync(sync_config(root), fanbox, sleep_fn=lambda _: None).run()
             creators, posts = read_download_state(root)
 
         self.assertEqual(creators, {"creator": 1})
@@ -581,11 +581,11 @@ class CreatorSyncTests(unittest.TestCase):
             posts={"page-1": [{"id": "123"}]},
             details={"123": ("title", [(first_url, ""), (second_url, "")])},
             content={first_url: b"one", second_url: b"two"},
-            failures={("download_file", second_url): [RuntimeError("failed")]},
+            failures={("download_file", second_url): [RuntimeError("failed")] * 4},
         )
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            sync = CreatorSync(sync_config(root), fanbox)
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=lambda _: None)
             sync.run()
             first_state = read_download_state(root)
             sync.run()
@@ -659,13 +659,13 @@ class CreatorSyncTests(unittest.TestCase):
         url = "https://example/file.jpg"
 
         class InterruptingFanbox(ScriptedFanbox):
-            interrupted = False
+            attempts = 0
 
             def download_file(self, resource_url, path):
                 self._call("download_file", resource_url)
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                if not self.interrupted:
-                    self.interrupted = True
+                self.attempts += 1
+                if self.attempts <= 4:
                     with open(path, "wb") as fp:
                         fp.write(b"partial")
                     raise RuntimeError("interrupted")
@@ -681,7 +681,7 @@ class CreatorSyncTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            sync = CreatorSync(sync_config(root), fanbox)
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=lambda _: None)
             sync.run()
             post_dir = os.path.join(root, "creator", "123-title")
             final_path = os.path.join(post_dir, "123_0.jpg")
@@ -737,7 +737,7 @@ class StateDatabaseTests(unittest.TestCase):
     def test_database_defaults_to_download_directory_and_uses_safe_pragmas(self):
         fanbox = ScriptedFanbox(pages={"creator": []})
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            CreatorSync(sync_config(root), fanbox).run()
+            CreatorSync(sync_config(root), fanbox, sleep_fn=lambda _: None).run()
             path = os.path.join(root, creator_sync.DATABASE_FILE)
             database = creator_sync._DownloadState(path)
             try:
@@ -796,10 +796,10 @@ class StateDatabaseTests(unittest.TestCase):
 
     def test_new_author_defaults_to_incomplete_when_listing_fails(self):
         fanbox = ScriptedFanbox(
-            failures={("author_pages", "creator"): [RuntimeError("failed")]}
+            failures={("author_pages", "creator"): [RuntimeError("failed")] * 4}
         )
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
-            CreatorSync(sync_config(root), fanbox).run()
+            CreatorSync(sync_config(root), fanbox, sleep_fn=lambda _: None).run()
             creators, _ = read_download_state(root)
 
         self.assertEqual(creators, {"creator": 0})

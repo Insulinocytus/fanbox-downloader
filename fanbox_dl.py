@@ -46,7 +46,11 @@ async ({url}) => {
             headers: {"Accept": "application/json, text/plain, */*"},
             signal: controller.signal
         });
-        return {status: response.status, text: await response.text()};
+        return {
+            status: response.status,
+            text: await response.text(),
+            headers: Object.fromEntries(response.headers.entries())
+        };
     } catch (error) {
         return {status: 0, text: String(error)};
     } finally {
@@ -220,6 +224,12 @@ def extract_post_files(post):
             out.append((url, name))
     return out
 
+
+def _response_retry_after(headers):
+    headers = headers or {}
+    return headers.get("retry-after") or headers.get("Retry-After")
+
+
 def _api_get_once(url):
     try:
         result = browser_fetch(url)
@@ -236,12 +246,20 @@ def _api_get_once(url):
         raise CloudflareBlocked("Fanbox 元数据请求被 Cloudflare 拦截")
     if status in (401, 403):
         sys.exit("登录失效(cookie 无效/过期)。请更新 FANBOX_COOKIE")
+    if status == 429:
+        retry_after = _response_retry_after(result.get("headers"))
+        raise RetryableFanboxError(
+            f"Fanbox API HTTP 429: {response_text[:200]}",
+            retry_after=retry_after,
+        )
     if status != 200:
-        raise RuntimeError(f"Fanbox API 返回 HTTP {status}: {response_text[:200]}")
+        raise RetryableFanboxError(
+            f"Fanbox API HTTP {status}: {response_text[:200]}"
+        )
     try:
         return json.loads(response_text)["body"]
     except (json.JSONDecodeError, KeyError) as exc:
-        raise RuntimeError("Fanbox API 返回内容不是有效 JSON") from exc
+        raise RetryableFanboxError("Fanbox API response is not valid JSON") from exc
 
 
 class Fanbox:
@@ -278,9 +296,21 @@ class Fanbox:
     def download_file(self, url, path):
         if os.path.exists(path):
             return False
-        response = sess().get(url, impersonate=IMPERSONATE, stream=True, timeout=60)
+        try:
+            response = sess().get(url, impersonate=IMPERSONATE, stream=True, timeout=60)
+        except Exception as exc:
+            raise RetryableFanboxError(str(exc)) from exc
         if response.status_code == 403 and "block_ip" in response.text:
             raise CloudflareBlocked("下载文件时被 Cloudflare 拦截")
+        if response.status_code == 429:
+            retry_after = _response_retry_after(getattr(response, "headers", None))
+            raise RetryableFanboxError(
+                "Fanbox file request was rate limited", retry_after=retry_after
+            )
+        if response.status_code >= 500:
+            raise RetryableFanboxError(
+                f"Fanbox file request HTTP {response.status_code}"
+            )
         response.raise_for_status()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as fp:

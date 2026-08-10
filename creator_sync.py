@@ -4,19 +4,26 @@ import re
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 
 DATABASE_FILE = ".fanbox-state.sqlite3"
 SCHEMA_VERSION = "1"
 POST_STATES = {"downloading", "downloaded", "empty", "restricted"}
-RETRY = 5
+MAX_ATTEMPTS = 4
+RETRY = MAX_ATTEMPTS
+RETRY_WAITS = (10, 30, 60)
 API_DELAY = 1.0
 CLOUDFLARE_WAITS = (30, 60, 120, 300)
 
 
 class RetryableFanboxError(RuntimeError):
-    """一次可重试的 Fanbox 元数据操作失败。"""
+    """A Fanbox operation failed in a way that may succeed on retry."""
 
+    def __init__(self, message, *, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 class FanboxTimeout(RetryableFanboxError):
     """一次 Fanbox 元数据操作超时。"""
@@ -28,6 +35,19 @@ class CloudflareBlocked(RuntimeError):
 
 class StateDatabaseError(RuntimeError):
     """下载记录数据库无法安全使用。"""
+
+
+class RetryExhausted(RuntimeError):
+    """A remote operation failed on all configured attempts."""
+
+    def __init__(self, scope, operation, attempts, cause):
+        self.scope = scope
+        self.operation = operation
+        self.attempts = attempts
+        self.cause = cause
+        super().__init__(
+            f"{operation} failed after {attempts} attempts: {cause}"
+        )
 
 
 @dataclass(frozen=True)
@@ -420,7 +440,7 @@ def _file_has_size(path, expected_size):
 class CreatorSync:
     """同步配置中的全部作者；公开接口只有无参数 run()。"""
 
-    def __init__(self, config, fanbox):
+    def __init__(self, config, fanbox, sleep_fn=None):
         self.config = config
         self.fanbox = fanbox
         self.root = config["download_directory"]
@@ -429,6 +449,7 @@ class CreatorSync:
         self.file_delay = config["file_delay"]
         self.post_delay = config["post_delay"]
         self.api_delay = API_DELAY
+        self.sleep_fn = sleep_fn or time.sleep
 
     def run(self):
         database = None
@@ -467,6 +488,9 @@ class CreatorSync:
         except CloudflareBlocked as exc:
             print(f"  {exc}")
             return False
+        except RetryExhausted as exc:
+            print(f"  {exc}")
+            return True
         except Exception as exc:
             print(f"  获取作者帖子列表失败,本轮跳过作者: {exc}")
             return True
@@ -481,6 +505,9 @@ class CreatorSync:
             except CloudflareBlocked as exc:
                 print(f"  {exc}")
                 return False
+            except RetryExhausted as exc:
+                print(f"  {exc}")
+                return True
             except Exception as exc:
                 print(
                     f"  第 {page_number}/{len(urls)} 页失败,本轮跳过作者: {exc}"
@@ -504,6 +531,11 @@ class CreatorSync:
             except CloudflareBlocked as exc:
                 print(f"\n  {exc}")
                 return False
+            except RetryExhausted as exc:
+                print(f"\n  {exc}")
+                if exc.scope != "file":
+                    return True
+                continue
             if result is not None:
                 total_new += result.downloaded_file_count
 
@@ -528,11 +560,13 @@ class CreatorSync:
             raise
         except CloudflareBlocked:
             raise
+        except RetryExhausted:
+            raise
         except Exception as exc:
             print(f"{failure_message}: {exc}")
             return None
         finally:
-            time.sleep(self.post_delay)
+            self.sleep_fn(self.post_delay)
 
     def _repair_downloads(self, database, creator):
         downloaded_file_count = 0
@@ -577,43 +611,66 @@ class CreatorSync:
             except CloudflareBlocked as exc:
                 print(f"  {exc}")
                 return False, downloaded_file_count
+            except RetryExhausted as exc:
+                print(f"  {exc}")
+                if exc.scope != "file":
+                    return False, downloaded_file_count
+                continue
             if result is not None:
                 downloaded_file_count += result.downloaded_file_count
         return True, downloaded_file_count
 
-    def _metadata(self, operation):
-        for attempt in range(1, RETRY + 1):
-            if attempt > 1:
-                print(f"  冷却结束,正在发起第 {attempt}/{RETRY} 次请求...", flush=True)
+    @staticmethod
+    def _retry_after(value):
+        if value is None:
+            return None
+        try:
+            return max(0, float(value))
+        except (TypeError, ValueError):
+            try:
+                date = parsedate_to_datetime(str(value))
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                return max(0, (date - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    def _retry(self, operation, *, scope, operation_name):
+        """Run one remote operation with the shared ordinary-failure policy."""
+        last_error = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 result = operation()
-            except CloudflareBlocked as exc:
-                if attempt >= RETRY:
-                    raise CloudflareBlocked(
-                        f"被 Cloudflare 拦截,重试 {RETRY - 1} 次仍失败。"
-                        "已安全停止,稍后重新运行即可从断点继续。"
+            except CloudflareBlocked:
+                raise
+            except (sqlite3.Error, StateDatabaseError):
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt >= MAX_ATTEMPTS:
+                    raise RetryExhausted(
+                        scope, operation_name, MAX_ATTEMPTS, exc
                     ) from exc
-                wait = CLOUDFLARE_WAITS[min(attempt - 1, len(CLOUDFLARE_WAITS) - 1)]
+                retry_after = self._retry_after(
+                    getattr(exc, "retry_after", None)
+                )
+                wait = retry_after if retry_after is not None else RETRY_WAITS[attempt - 1]
                 print(
-                    f"  Cloudflare 临时拦截,{wait}s 后重试"
-                    f"(下一次 {attempt + 1}/{RETRY})",
+                    f"  {operation_name} failed ({attempt}/{MAX_ATTEMPTS}): "
+                    f"{exc}; retrying in {wait:g}s",
                     flush=True,
                 )
-                wait_with_progress(wait)
-            except RetryableFanboxError as exc:
-                if attempt >= RETRY:
-                    raise
-                wait = 2 ** attempt
-                if isinstance(exc, FanboxTimeout):
-                    message = "浏览器请求超时"
-                else:
-                    message = f"浏览器请求错误({exc})"
-                print(f"  {message},{wait}s 后重试({attempt}/{RETRY})", flush=True)
-                time.sleep(wait)
+                self.sleep_fn(wait)
             else:
-                time.sleep(self.api_delay)
+                if self.api_delay:
+                    self.sleep_fn(self.api_delay)
                 return result
-        raise RuntimeError("unreachable")
+        raise RetryExhausted(scope, operation_name, MAX_ATTEMPTS, last_error)
+
+    def _metadata(self, operation):
+        return self._retry(
+            operation, scope="author", operation_name="metadata"
+        )
 
     def _process_post(self, database, key, post):
         post_id = str(post["id"])
@@ -646,6 +703,20 @@ class CreatorSync:
             database, key, title, directory_path
         )
 
+    def _download_file_attempt(self, file, part_path):
+        if os.path.exists(part_path):
+            os.remove(part_path)
+        created = self.fanbox.download_file(file.resource_url, part_path)
+        if not created or not os.path.isfile(part_path):
+            raise RuntimeError("download did not produce a file")
+        actual_size = os.path.getsize(part_path)
+        if file.expected_size is not None and actual_size != file.expected_size:
+            raise RuntimeError(
+                f"download size {actual_size} does not match expected "
+                f"{file.expected_size}"
+            )
+        return actual_size
+
     def _download_manifest(
         self, database, key, title, directory_path
     ):
@@ -662,21 +733,11 @@ class CreatorSync:
                 ):
                     continue
 
-                if os.path.exists(part_path):
-                    os.remove(part_path)
-                created = self.fanbox.download_file(file.resource_url, part_path)
-                if not created or not os.path.isfile(part_path):
-                    raise RuntimeError("文件传输未产生临时文件")
-
-                actual_size = os.path.getsize(part_path)
-                if (
-                    file.expected_size is not None
-                    and actual_size != file.expected_size
-                ):
-                    raise RuntimeError(
-                        f"下载大小 {actual_size} 与快照大小 "
-                        f"{file.expected_size} 不一致"
-                    )
+                actual_size = self._retry(
+                    lambda: self._download_file_attempt(file, part_path),
+                    scope="file",
+                    operation_name=f"download_file:{file.resource_url}",
+                )
 
                 database.stage_file(
                     key, file.position, actual_size
@@ -688,11 +749,13 @@ class CreatorSync:
                 raise
             except CloudflareBlocked:
                 raise
+            except RetryExhausted:
+                raise
             except Exception as exc:
                 failed = True
                 print(f"\n  下载 {file.resource_url} 失败: {exc}")
             finally:
-                time.sleep(self.file_delay)
+                self.sleep_fn(self.file_delay)
 
         if failed or not database.all_files_complete(key):
             print(f"未完成 -> {directory_path}")
