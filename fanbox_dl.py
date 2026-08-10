@@ -3,10 +3,10 @@
 """Fanbox 下载器：通过环境变量配置，并按 cron 常驻运行。"""
 import atexit
 import json
+import logging
 import os
 import re
 import signal
-import sys
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -16,6 +16,7 @@ from croniter import croniter
 from curl_cffi import requests
 
 from creator_sync import (
+    AuthenticationError,
     CloudflareBlocked,
     CreatorSync,
     FanboxTimeout,
@@ -26,6 +27,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_CRON = "0 */6 * * *"
 
 _shutdown_requested = False
+logger = logging.getLogger(__name__)
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -67,19 +69,20 @@ _cookie_value = None
 def read_config(env=None):
     """Read and validate the complete runtime configuration from the environment."""
     env = os.environ if env is None else env
+    errors = []
 
     cookie = env.get("FANBOX_COOKIE", "").strip()
     if not cookie:
-        sys.exit("FANBOX_COOKIE 必须设置且不能为空")
+        errors.append("FANBOX_COOKIE 必须设置且不能为空")
 
     creators = [creator.strip() for creator in env.get("FANBOX_CREATORS", "").split(",")
                 if creator.strip()]
     if not creators:
-        sys.exit("FANBOX_CREATORS 必须设置至少一个作者 ID")
+        errors.append("FANBOX_CREATORS 必须设置至少一个作者 ID")
 
     download_directory = env.get("FANBOX_DOWNLOAD_DIRECTORY", "/data/downloads").strip()
     if not download_directory:
-        sys.exit("FANBOX_DOWNLOAD_DIRECTORY 不能为空")
+        errors.append("FANBOX_DOWNLOAD_DIRECTORY 不能为空")
     if not os.path.isabs(download_directory) and not download_directory.startswith("/"):
         download_directory = os.path.abspath(download_directory)
 
@@ -94,32 +97,42 @@ def read_config(env=None):
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            sys.exit(f"{name} 必须是非负数字")
+            errors.append(f"{name} 必须是非负数字")
+            return default
         if value < 0:
-            sys.exit(f"{name} 必须是非负数字")
+            errors.append(f"{name} 必须是非负数字")
+            return default
         return value
+
+    file_delay = read_delay("FANBOX_FILE_DELAY", 0)
+    post_delay = read_delay("FANBOX_POST_DELAY", 10)
 
     timezone_name = env.get("FANBOX_TIMEZONE", DEFAULT_TIMEZONE).strip()
     try:
         timezone = ZoneInfo(timezone_name)
     except (ValueError, ZoneInfoNotFoundError):
-        sys.exit(f"FANBOX_TIMEZONE 无效: {timezone_name}")
+        errors.append("FANBOX_TIMEZONE 无效")
+        timezone = ZoneInfo(DEFAULT_TIMEZONE)
 
     cron_expression = env.get("FANBOX_CRON", DEFAULT_CRON).strip()
     if not cron_expression or not croniter.is_valid(cron_expression):
-        sys.exit("FANBOX_CRON 必须是有效的五段式 cron 表达式")
+        errors.append("FANBOX_CRON 必须是有效的五段式 cron 表达式")
 
     run_on_start = env.get("FANBOX_RUN_ON_START", "false").strip().lower()
     if run_on_start not in {"true", "false"}:
-        sys.exit("FANBOX_RUN_ON_START 必须是 true 或 false")
+        errors.append("FANBOX_RUN_ON_START 必须是 true 或 false")
+
+    if errors:
+        logger.error("配置无效:\n%s", "\n".join(f"- {error}" for error in errors))
+        raise SystemExit(1)
 
     return {
         "cookie": cookie,
         "creators": creators,
         "download_directory": download_directory,
         "state_directory": state_directory,
-        "file_delay": read_delay("FANBOX_FILE_DELAY", 0),
-        "post_delay": read_delay("FANBOX_POST_DELAY", 10),
+        "file_delay": file_delay,
+        "post_delay": post_delay,
         "timezone": timezone,
         "cron": cron_expression,
         "run_on_start": run_on_start == "true",
@@ -146,7 +159,7 @@ def browser_fetch(url):
     if _browser_page is None:
         if _cookie_value is None:
             configure()
-        print("正在启动 CloakBrowser...", flush=True)
+        logger.info("正在启动 CloakBrowser")
         _browser_context = launch_context(
             headless=True,
             humanize=True,
@@ -167,7 +180,7 @@ def browser_fetch(url):
             wait_until="domcontentloaded",
             timeout=60000,
         )
-        print("CloakBrowser 已登录 Fanbox，开始后台 API 请求。", flush=True)
+        logger.info("CloakBrowser 已登录 Fanbox，开始后台 API 请求")
     return _browser_page.evaluate(BROWSER_FETCH_SCRIPT, {"url": url})
 
 def close_browser():
@@ -245,7 +258,7 @@ def _api_get_once(url):
             "challenge" in response_text.lower()):
         raise CloudflareBlocked("Fanbox 元数据请求被 Cloudflare 拦截")
     if status in (401, 403):
-        sys.exit("登录失效(cookie 无效/过期)。请更新 FANBOX_COOKIE")
+        raise AuthenticationError("登录失效或账号未授权，请更新 FANBOX_COOKIE")
     if status == 429:
         retry_after = _response_retry_after(result.get("headers"))
         raise RetryableFanboxError(
@@ -311,8 +324,12 @@ class Fanbox:
             response = sess().get(url, impersonate=IMPERSONATE, stream=True, timeout=60)
         except Exception as exc:
             raise RetryableFanboxError(str(exc)) from exc
-        if response.status_code == 403 and "block_ip" in response.text:
+        if response.status_code == 403 and (
+            "block_ip" in response.text or "challenge" in response.text.lower()
+        ):
             raise CloudflareBlocked("下载文件时被 Cloudflare 拦截")
+        if response.status_code in (401, 403):
+            raise AuthenticationError("登录失效或账号未授权，请更新 FANBOX_COOKIE")
         if response.status_code == 429:
             retry_after = _response_retry_after(getattr(response, "headers", None))
             raise RetryableFanboxError(
@@ -352,7 +369,7 @@ def run_scheduler(config, sync=None, now_fn=None, sleep_fn=time.sleep):
 
     while not _shutdown_requested:
         next_run = next_scheduled_time(config["cron"], config["timezone"], now_fn())
-        print(f"下一次执行时间: {next_run.isoformat()}", flush=True)
+        logger.info("下一次执行时间: %s", next_run.isoformat())
         while not _shutdown_requested:
             remaining = (next_run - now_fn()).total_seconds()
             if remaining <= 0:
@@ -365,11 +382,15 @@ def run_scheduler(config, sync=None, now_fn=None, sleep_fn=time.sleep):
 def handle_shutdown(signum, _frame):
     global _shutdown_requested
     _shutdown_requested = True
-    print(f"收到信号 {signum}，正在停止调度。", flush=True)
+    logger.info("收到信号 %s，正在停止调度", signum)
     close_browser()
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     config = configure()
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)

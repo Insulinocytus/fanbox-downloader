@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import creator_sync
 import fanbox_dl
 from creator_sync import (
+    AuthenticationError,
     CloudflareBlocked,
     CreatorSync,
     FanboxTimeout,
@@ -89,10 +90,11 @@ def retry_failures(message):
 
 class ConfigurationTests(unittest.TestCase):
     def test_requires_cookie(self):
-        with self.assertRaises(SystemExit) as error:
+        with self.assertLogs("fanbox_dl", level="ERROR") as logs, \
+             self.assertRaises(SystemExit):
             read_config({"FANBOX_CREATORS": "creator"})
 
-        self.assertIn("FANBOX_COOKIE", str(error.exception))
+        self.assertIn("FANBOX_COOKIE", "\n".join(logs.output))
 
     def test_reads_environment_defaults(self):
         config = read_config({
@@ -121,9 +123,40 @@ class ConfigurationTests(unittest.TestCase):
         ]
 
         for environment, name in cases:
-            with self.subTest(name=name), self.assertRaises(SystemExit) as error:
+            with self.subTest(name=name), self.assertLogs("fanbox_dl", level="ERROR") as logs, \
+                 self.assertRaises(SystemExit):
                 read_config(environment)
-            self.assertIn(name, str(error.exception))
+            self.assertIn(name, "\n".join(logs.output))
+
+    def test_reports_all_configuration_errors_without_exposing_cookie(self):
+        secret = "super-secret-cookie"
+        environment = {
+            "FANBOX_COOKIE": secret,
+            "FANBOX_CREATORS": "",
+            "FANBOX_DOWNLOAD_DIRECTORY": "",
+            "FANBOX_FILE_DELAY": "-1",
+            "FANBOX_POST_DELAY": "not-a-number",
+            "FANBOX_TIMEZONE": "invalid/zone",
+            "FANBOX_CRON": "not cron",
+            "FANBOX_RUN_ON_START": "maybe",
+        }
+
+        with self.assertLogs("fanbox_dl", level="ERROR") as logs, \
+             self.assertRaises(SystemExit):
+            read_config(environment)
+
+        output = "\n".join(logs.output)
+        for name in (
+            "FANBOX_CREATORS",
+            "FANBOX_DOWNLOAD_DIRECTORY",
+            "FANBOX_FILE_DELAY",
+            "FANBOX_POST_DELAY",
+            "FANBOX_TIMEZONE",
+            "FANBOX_CRON",
+            "FANBOX_RUN_ON_START",
+        ):
+            self.assertIn(name, output)
+        self.assertNotIn(secret, output)
 
 
 class SchedulerTests(unittest.TestCase):
@@ -194,6 +227,36 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(calls, ["run"])
         self.assertEqual(len(waits), 1)
+
+    def test_cloudflare_aborted_run_does_not_stop_scheduler(self):
+        calls = []
+        config = read_config({
+            "FANBOX_COOKIE": "cookie",
+            "FANBOX_CREATORS": "creator",
+            "FANBOX_CRON": "0 * * * *",
+            "FANBOX_RUN_ON_START": "true",
+        })
+
+        class Sync:
+            def run(self):
+                calls.append("run")
+                if len(calls) == 2:
+                    fanbox_dl._shutdown_requested = True
+                return "cloudflare_aborted"
+
+        times = iter([
+            datetime(2024, 1, 1, 0, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+            datetime(2024, 1, 1, 1, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        ])
+        with redirect_stdout(StringIO()):
+            run_scheduler(
+                config,
+                sync=Sync(),
+                now_fn=lambda: next(times),
+                sleep_fn=lambda _: None,
+            )
+
+        self.assertEqual(calls, ["run", "run"])
 
 
 class BrowserLifecycleTests(unittest.TestCase):
@@ -309,7 +372,7 @@ class FanboxAdapterTests(unittest.TestCase):
             Fanbox().page_posts("page-1")
         with patch.object(
             fanbox_dl, "browser_fetch", return_value={"status": 401, "text": "expired"}
-        ), self.assertRaises(SystemExit):
+        ), self.assertRaises(AuthenticationError):
             Fanbox().page_posts("page-1")
 
         with patch.object(
@@ -349,17 +412,41 @@ class FanboxAdapterTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual(content, b"file bytes")
 
+    def test_file_operation_classifies_cloudflare_challenge(self):
+        class Response:
+            status_code = 403
+            text = "Cloudflare challenge required"
+
+        class Session:
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(fanbox_dl, "sess", return_value=Session()), \
+             self.assertRaises(CloudflareBlocked):
+            Fanbox().download_file(
+                "https://example/file",
+                os.path.join(root, "post", "file.bin"),
+            )
+
     def test_sync_owns_metadata_retry(self):
         fanbox = ScriptedFanbox(
             pages={"creator": []},
             failures={("author_pages", "creator"): [FanboxTimeout("timeout")]},
         )
         with tempfile.TemporaryDirectory() as root, patch("creator_sync.time.sleep") as sleep, \
-             redirect_stdout(StringIO()):
+             self.assertLogs("creator_sync", level="WARNING") as logs:
             CreatorSync(sync_config(root), fanbox).run()
 
         self.assertEqual(fanbox.calls.count(("author_pages", "creator")), 2)
         sleep.assert_any_call(10)
+        failure = "\n".join(logs.output)
+        self.assertIn("operation=author_pages", failure)
+        self.assertIn("author=creator", failure)
+        self.assertIn("category=retryable", failure)
+        self.assertIn("attempt=1/4", failure)
+        self.assertIn("wait=10s", failure)
+        self.assertIn("escalation=retry", failure)
 
     def test_exhausted_retry_uses_four_attempts_and_backoff_sequence(self):
         waits = []
@@ -399,18 +486,18 @@ class FanboxAdapterTests(unittest.TestCase):
         self.assertEqual(fanbox.calls.count(("author_pages", "creator")), 1)
 
     def test_cloudflare_wait_prints_progress_every_ten_seconds(self):
-        output = StringIO()
         waits = []
-        with patch("creator_sync.time.sleep", side_effect=waits.append), redirect_stdout(output):
+        with patch("creator_sync.time.sleep", side_effect=waits.append), \
+             self.assertLogs("creator_sync", level="INFO") as logs:
             wait_with_progress(25)
 
         self.assertEqual(waits, [10, 10, 5])
         self.assertEqual(
-            output.getvalue().splitlines(),
+            [line.rsplit("wait=", 1)[1] for line in logs.output],
             [
-                "  Cloudflare 冷却中,剩余约 25 秒",
-                "  Cloudflare 冷却中,剩余约 15 秒",
-                "  Cloudflare 冷却中,剩余约 5 秒",
+                "25s escalation=retry",
+                "15s escalation=retry",
+                "5s escalation=retry",
             ],
         )
 
@@ -466,6 +553,132 @@ def read_manifest(directory, post_id):
 
 
 class CreatorSyncTests(unittest.TestCase):
+    def test_non_cloudflare_failures_reset_task_cloudflare_streak(self):
+        waits = []
+        fanbox = ScriptedFanbox(
+            pages={"creator": []},
+            failures={
+                ("author_pages", "creator"): [
+                    CloudflareBlocked("blocked-1"),
+                    RetryableFanboxError("ordinary-1"),
+                    CloudflareBlocked("blocked-2"),
+                    RetryableFanboxError("ordinary-2"),
+                    CloudflareBlocked("blocked-3"),
+                    None,
+                ]
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as root, \
+             self.assertLogs("creator_sync", level="INFO"):
+            result = CreatorSync(
+                sync_config(root), fanbox, sleep_fn=waits.append
+            ).run()
+
+        self.assertEqual(result.outcome, "complete")
+        self.assertEqual(result.cloudflare_blocks, 3)
+        self.assertEqual(waits, [10, 10, 10, 10, 10, 10, 10, 30, 10, 10, 10])
+
+    def test_third_consecutive_cloudflare_block_aborts_run_and_skips_authors(self):
+        fanbox = ScriptedFanbox(
+            pages={"first": [], "second": []},
+            failures={
+                ("author_pages", "first"): [
+                    CloudflareBlocked("blocked-1"),
+                    CloudflareBlocked("blocked-2"),
+                    CloudflareBlocked("blocked-3"),
+                ]
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as root, \
+             self.assertLogs("creator_sync", level="INFO") as logs:
+            result = CreatorSync(
+                sync_config(root, creators=["first", "second"]),
+                fanbox,
+                sleep_fn=no_sleep,
+            ).run()
+
+        self.assertEqual(result.outcome, "cloudflare_aborted")
+        self.assertEqual(result.creators_partial, 1)
+        self.assertEqual(result.creators_skipped, 1)
+        self.assertEqual(result.cloudflare_blocks, 3)
+        self.assertEqual(fanbox.calls.count(("author_pages", "first")), 3)
+        self.assertNotIn(("author_pages", "second"), fanbox.calls)
+        summary = "\n".join(logs.output)
+        self.assertIn("outcome=cloudflare_aborted", summary)
+        self.assertIn("creators_skipped=1", summary)
+
+    def test_each_run_starts_with_zero_cloudflare_streak(self):
+        fanbox = ScriptedFanbox(
+            pages={"creator": []},
+            failures={
+                ("author_pages", "creator"): [
+                    CloudflareBlocked("blocked-1"),
+                    CloudflareBlocked("blocked-2"),
+                    CloudflareBlocked("blocked-3"),
+                ]
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as root, \
+             self.assertLogs("creator_sync", level="INFO"):
+            sync = CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep)
+            first = sync.run()
+            second = sync.run()
+
+        self.assertEqual(first.outcome, "cloudflare_aborted")
+        self.assertEqual(second.outcome, "complete")
+        self.assertEqual(second.cloudflare_blocks, 0)
+
+    def test_authentication_error_terminates_without_retrying(self):
+        fanbox = ScriptedFanbox(
+            failures={
+                ("author_pages", "creator"): [
+                    creator_sync.AuthenticationError("登录失效")
+                ]
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as root, \
+             self.assertLogs("creator_sync", level="ERROR") as logs, \
+             self.assertRaises(SystemExit) as exit_error:
+            CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep).run()
+
+        self.assertEqual(exit_error.exception.code, 1)
+        self.assertEqual(fanbox.calls.count(("author_pages", "creator")), 1)
+        self.assertTrue(fanbox.closed)
+        output = "\n".join(logs.output)
+        self.assertIn("category=authentication", output)
+        self.assertIn("operation=author_pages", output)
+        self.assertIn("author=creator", output)
+        self.assertIn("escalation=terminate_process", output)
+
+    def test_atomic_rename_error_terminates_process(self):
+        url = "https://example/file.bin"
+        fanbox = ScriptedFanbox(
+            pages={"creator": ["page-1"]},
+            posts={"page-1": [{"id": "1"}]},
+            details={"1": ("title", [(url, "")])},
+            content={url: b"content"},
+        )
+
+        with tempfile.TemporaryDirectory() as root, \
+             patch("creator_sync.os.replace", side_effect=OSError("disk full")), \
+             self.assertLogs("creator_sync", level="ERROR") as logs, \
+             self.assertRaises(SystemExit) as exit_error:
+            CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep).run()
+
+        self.assertEqual(exit_error.exception.code, 1)
+        self.assertTrue(fanbox.closed)
+        output = "\n".join(logs.output)
+        self.assertIn("category=local_persistence", output)
+        self.assertIn("operation=atomic_rename", output)
+        self.assertIn("author=creator", output)
+        self.assertIn("post=1", output)
+        self.assertIn("file=", output)
+        self.assertIn("escalation=terminate_process", output)
+
     def test_complete_baseline_persists_downloaded_empty_and_restricted_posts(self):
         file_url = "https://example/cover.jpg"
         named_url = "https://example/archive"
@@ -646,12 +859,20 @@ class CreatorSyncTests(unittest.TestCase):
             failures={("download_file", url): [RuntimeError("HTTP 404")]},
         )
 
-        with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
+        with tempfile.TemporaryDirectory() as root, \
+             self.assertLogs("creator_sync", level="ERROR") as logs:
             CreatorSync(sync_config(root), fanbox, sleep_fn=no_sleep).run()
             _, posts = read_download_state(root)
 
         self.assertEqual(fanbox.calls.count(("download_file", url)), 1)
         self.assertEqual(posts[("creator", "123")]["status"], "downloading")
+        failure = "\n".join(logs.output)
+        self.assertIn("operation=download_file", failure)
+        self.assertIn("author=creator", failure)
+        self.assertIn("post=123", failure)
+        self.assertIn("category=permanent_remote", failure)
+        self.assertIn("escalation=skip_post", failure)
+        self.assertNotIn(url, failure)
 
     def test_partial_download_retries_without_reopening_the_baseline(self):
         first_url = "https://example/1.jpg"
@@ -831,18 +1052,27 @@ class CreatorSyncTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as root, redirect_stdout(StringIO()):
             sync = CreatorSync(sync_config(root), fanbox)
-            with patch("creator_sync.os.replace", side_effect=interrupt_first_promotion):
+            with patch("creator_sync.os.replace", side_effect=interrupt_first_promotion), \
+                 self.assertLogs("creator_sync", level="ERROR"), \
+                 self.assertRaises(SystemExit) as exit_error:
                 sync.run()
             staged = read_manifest(root, "123")
             calls_after_failure = fanbox.calls.count(("download_file", url))
+
+            with patch("creator_sync.os.replace", side_effect=OSError("recovery rename failed")), \
+                 self.assertLogs("creator_sync", level="ERROR") as recovery_logs, \
+                 self.assertRaises(SystemExit):
+                sync.run()
 
             sync.run()
             completed = read_manifest(root, "123")
             calls_after_recovery = fanbox.calls.count(("download_file", url))
 
+        self.assertEqual(exit_error.exception.code, 1)
         self.assertEqual(staged[0]["phase"], "staged")
         self.assertEqual(completed[0]["phase"], "complete")
         self.assertEqual((calls_after_failure, calls_after_recovery), (1, 1))
+        self.assertIn("operation=atomic_rename", "\n".join(recovery_logs.output))
 
 
 class StateDatabaseTests(unittest.TestCase):
@@ -895,15 +1125,16 @@ class StateDatabaseTests(unittest.TestCase):
             path = os.path.join(root, creator_sync.DATABASE_FILE)
             with open(path, "wb") as fp:
                 fp.write(corrupt)
-            errors = StringIO()
-            with redirect_stderr(errors), self.assertRaises(SystemExit) as exit_error:
+            with self.assertLogs("creator_sync", level="ERROR") as logs, \
+                 self.assertRaises(SystemExit) as exit_error:
                 CreatorSync(sync_config(root), fanbox).run()
             with open(path, "rb") as fp:
                 after = fp.read()
 
         self.assertEqual(exit_error.exception.code, 1)
         self.assertEqual(after, corrupt)
-        self.assertIn("数据库不可用", errors.getvalue())
+        self.assertIn("operation=open_database", "\n".join(logs.output))
+        self.assertIn("category=local_persistence", "\n".join(logs.output))
         self.assertTrue(fanbox.closed)
 
     def test_new_author_defaults_to_incomplete_when_listing_fails(self):

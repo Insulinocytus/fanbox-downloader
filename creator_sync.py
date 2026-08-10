@@ -2,7 +2,7 @@
 import os
 import re
 import sqlite3
-import sys
+import logging
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -16,6 +16,8 @@ MAX_ATTEMPTS = 4
 RETRY_WAITS = (10, 30, 60)
 API_DELAY = 1.0
 CLOUDFLARE_WAITS = (30, 60, 120, 300)
+MAX_CONSECUTIVE_CLOUDFLARE = 3
+logger = logging.getLogger(__name__)
 
 
 class RetryableFanboxError(RuntimeError):
@@ -31,6 +33,22 @@ class FanboxTimeout(RetryableFanboxError):
 
 class CloudflareBlocked(RuntimeError):
     """Fanbox 明确报告 Cloudflare 拦截。"""
+
+
+class AuthenticationError(RuntimeError):
+    """Fanbox Cookie 失效或账号未授权。"""
+
+
+class LocalPersistenceError(RuntimeError):
+    """下载产物无法安全写入本地存储。"""
+
+    def __init__(self, operation, cause, *, creator_id=None, post_id=None, file_path=None):
+        self.operation = operation
+        self.cause = cause
+        self.creator_id = creator_id
+        self.post_id = post_id
+        self.file_path = file_path
+        super().__init__(str(cause))
 
 
 class RetryScope(StrEnum):
@@ -60,6 +78,16 @@ class RetryExhausted(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SyncResult:
+    outcome: str
+    creators_completed: int
+    creators_partial: int
+    creators_skipped: int
+    files_downloaded: int
+    cloudflare_blocks: int
+
+
+@dataclass(frozen=True)
 class _PostResult:
     status: str | None
     downloaded_file_count: int
@@ -86,7 +114,11 @@ def wait_with_progress(seconds, sleep_fn=None):
     sleep_fn = sleep_fn or time.sleep
     remaining = int(seconds)
     while remaining > 0:
-        print(f"  Cloudflare 冷却中,剩余约 {remaining} 秒", flush=True)
+        logger.info(
+            "operation=cloudflare_cooldown category=cloudflare wait=%ss "
+            "escalation=retry",
+            remaining,
+        )
         wait = min(10, remaining)
         sleep_fn(wait)
         remaining -= wait
@@ -463,66 +495,164 @@ class CreatorSync:
 
     def run(self):
         database = None
+        self._cloudflare_streak = 0
+        self._cloudflare_blocks = 0
+        creators_completed = 0
+        creators_partial = 0
+        files_downloaded = 0
         try:
             try:
                 database = _DownloadState(self.database_path)
             except StateDatabaseError as exc:
-                print(f"错误: 下载记录数据库不可用: {exc}", file=sys.stderr, flush=True)
+                logger.error(
+                    "operation=open_database file=%s category=local_persistence "
+                    "attempt=1/1 wait=none escalation=terminate_process error=%s",
+                    self.database_path,
+                    exc,
+                )
                 raise SystemExit(1) from exc
 
             try:
-                for creator in self.config["creators"]:
-                    if not self._run_creator(database, creator):
-                        return
-            except sqlite3.Error as exc:
-                print(
-                    f"错误: 下载记录数据库操作失败: {self.database_path}: {exc}",
-                    file=sys.stderr,
-                    flush=True,
+                creators = self.config["creators"]
+                for index, creator in enumerate(creators):
+                    outcome, downloaded = self._run_creator(database, creator)
+                    files_downloaded += downloaded
+                    if outcome == "cloudflare_aborted":
+                        result = SyncResult(
+                            "cloudflare_aborted",
+                            creators_completed,
+                            creators_partial + 1,
+                            len(creators) - index - 1,
+                            files_downloaded,
+                            self._cloudflare_blocks,
+                        )
+                        self._log_summary(result)
+                        return result
+                    if outcome == "partial":
+                        creators_partial += 1
+                    else:
+                        creators_completed += 1
+            except AuthenticationError as exc:
+                logger.error(
+                    "operation=%s author=%s post=%s file=%s category=authentication "
+                    "attempt=1/1 wait=none escalation=terminate_process error=%s",
+                    getattr(exc, "operation", "fanbox_request"),
+                    getattr(exc, "creator_id", None),
+                    getattr(exc, "post_id", None),
+                    getattr(exc, "file_path", None),
+                    exc,
                 )
                 raise SystemExit(1) from exc
-            print("\n全部完成。")
+            except LocalPersistenceError as exc:
+                logger.error(
+                    "operation=%s author=%s post=%s file=%s category=local_persistence "
+                    "attempt=1/1 wait=none escalation=terminate_process error=%s",
+                    exc.operation,
+                    exc.creator_id,
+                    exc.post_id,
+                    exc.file_path,
+                    exc,
+                )
+                raise SystemExit(1) from exc
+            except sqlite3.Error as exc:
+                logger.error(
+                    "operation=database_sync file=%s category=local_persistence "
+                    "attempt=1/1 wait=none escalation=terminate_process error=%s",
+                    self.database_path,
+                    exc,
+                )
+                raise SystemExit(1) from exc
+            except OSError as exc:
+                logger.error(
+                    "operation=sync category=local_persistence attempt=1/1 "
+                    "wait=none escalation=terminate_process error=%s",
+                    exc,
+                )
+                raise SystemExit(1) from exc
+            result = SyncResult(
+                "partial" if creators_partial else "complete",
+                creators_completed,
+                creators_partial,
+                0,
+                files_downloaded,
+                self._cloudflare_blocks,
+            )
+            self._log_summary(result)
+            return result
         finally:
             if database is not None:
                 database.close()
             self.fanbox.close()
 
+    @staticmethod
+    def _log_summary(result):
+        logger.info(
+            "sync_summary outcome=%s creators_completed=%s creators_partial=%s "
+            "creators_skipped=%s files_downloaded=%s cloudflare_blocks=%s",
+            result.outcome,
+            result.creators_completed,
+            result.creators_partial,
+            result.creators_skipped,
+            result.files_downloaded,
+            result.cloudflare_blocks,
+        )
+
     def _run_creator(self, database, creator):
-        print(f"\n===== 作者: {creator} =====")
+        logger.info("operation=sync_author author=%s", creator)
         database.ensure_creator(creator)
         baseline_complete = database.baseline_complete(creator)
         total_new = 0
+        partial = False
 
         try:
-            urls = self._metadata(lambda: self.fanbox.author_pages(creator))
+            urls = self._metadata(
+                lambda: self.fanbox.author_pages(creator),
+                operation_name="author_pages",
+                creator_id=creator,
+            )
+        except (AuthenticationError, LocalPersistenceError, OSError):
+            raise
         except CloudflareBlocked as exc:
-            print(f"  {exc}")
-            return False
+            return "cloudflare_aborted", total_new
         except RetryExhausted as exc:
-            print(f"  {exc}")
-            return True
+            return "partial", total_new
         except Exception as exc:
-            print(f"  获取作者帖子列表失败,本轮跳过作者: {exc}")
-            return True
+            logger.error(
+                "operation=author_pages author=%s category=permanent_remote "
+                "attempt=1/1 wait=none escalation=skip_author error=%s",
+                creator,
+                exc,
+            )
+            return "partial", total_new
 
         known_pages = 0
         for page_number, url in enumerate(urls, 1):
             try:
-                posts = self._metadata(lambda url=url: self.fanbox.page_posts(url))
+                posts = self._metadata(
+                    lambda url=url: self.fanbox.page_posts(url),
+                    operation_name="page_posts",
+                    creator_id=creator,
+                )
                 page_was_known = database.record_page(creator, posts)
             except sqlite3.Error:
                 raise
+            except (AuthenticationError, LocalPersistenceError, OSError):
+                raise
             except CloudflareBlocked as exc:
-                print(f"  {exc}")
-                return False
+                return "cloudflare_aborted", total_new
             except RetryExhausted as exc:
-                print(f"  {exc}")
-                return True
+                return "partial", total_new
             except Exception as exc:
-                print(
-                    f"  第 {page_number}/{len(urls)} 页失败,本轮跳过作者: {exc}"
+                logger.error(
+                    "operation=page_posts author=%s page=%s/%s "
+                    "category=permanent_remote attempt=1/1 wait=none "
+                    "escalation=skip_author error=%s",
+                    creator,
+                    page_number,
+                    len(urls),
+                    exc,
                 )
-                return True
+                return "partial", total_new
             if baseline_complete:
                 known_pages = known_pages + 1 if page_was_known else 0
                 if known_pages >= 2:
@@ -533,33 +663,41 @@ class CreatorSync:
 
         for post in database.pending_posts(creator):
             post_id = str(post["id"])
-            print(f"  帖子 {post_id} ...", end=" ", flush=True)
+            logger.info("operation=process_post author=%s post=%s", creator, post_id)
             try:
                 result = self._attempt_recorded_post(
                     database, creator, post, "失败"
                 )
             except CloudflareBlocked as exc:
-                print(f"\n  {exc}")
-                return False
+                return "cloudflare_aborted", total_new
             except RetryExhausted as exc:
-                print(f"\n  {exc}")
                 if exc.skips_author:
-                    return True
+                    return "partial", total_new
+                partial = True
                 continue
             if result is not None:
                 total_new += result.downloaded_file_count
+                partial = partial or result.status is None
+            else:
+                partial = True
 
         try:
-            repair_ok, repaired = self._repair_downloads(database, creator)
+            repair_outcome, repaired = self._repair_downloads(database, creator)
         except RetryExhausted as exc:
-            print(f"  {exc}")
-            return True
+            return "partial", total_new
         total_new += repaired
-        if not repair_ok:
-            return False
+        if repair_outcome == "cloudflare_aborted":
+            return "cloudflare_aborted", total_new
+        partial = partial or repair_outcome == "partial"
 
-        print(f"  >> 本作者新增 {total_new} 个文件 -> {os.path.join(self.root, creator)}")
-        return True
+        logger.info(
+            "operation=sync_author author=%s files_downloaded=%s outcome=%s directory=%s",
+            creator,
+            total_new,
+            "partial" if partial else "complete",
+            os.path.join(self.root, creator),
+        )
+        return ("partial" if partial else "complete"), total_new
 
     def _process_recorded_post(self, database, creator, post):
         key = _PostKey(creator, str(post["id"]))
@@ -572,18 +710,28 @@ class CreatorSync:
             return self._process_recorded_post(database, creator, post)
         except sqlite3.Error:
             raise
+        except (AuthenticationError, LocalPersistenceError, OSError):
+            raise
         except CloudflareBlocked:
             raise
         except RetryExhausted:
             raise
         except Exception as exc:
-            print(f"{failure_message}: {exc}")
+            logger.error(
+                "operation=process_post author=%s post=%s category=permanent_remote "
+                "attempt=1/1 wait=none escalation=skip_post error=%s detail=%s",
+                creator,
+                post.get("id"),
+                exc,
+                failure_message,
+            )
             return None
         finally:
             self.sleep_fn(self.post_delay)
 
     def _repair_downloads(self, database, creator):
         downloaded_file_count = 0
+        partial = False
         for post in database.downloaded_posts(creator):
             key = _PostKey(creator, str(post["id"]))
             post_id = key.post_id
@@ -591,7 +739,11 @@ class CreatorSync:
             files = database.manifest_files(key)
 
             if not directory_path or not os.path.isdir(directory_path):
-                print(f"  帖子 {post_id} 目录已删除,执行快照重置...", flush=True)
+                logger.info(
+                    "operation=reset_snapshot author=%s post=%s reason=missing_directory",
+                    creator,
+                    post_id,
+                )
                 database.reset_post(key)
             else:
                 broken = [
@@ -606,13 +758,19 @@ class CreatorSync:
                 if files and not broken:
                     continue
                 if files:
-                    print(
-                        f"  帖子 {post_id} 有 {len(broken)} 个文件需要下载修复...",
-                        flush=True,
+                    logger.info(
+                        "operation=repair_download author=%s post=%s files=%s",
+                        creator,
+                        post_id,
+                        len(broken),
                     )
                     database.restart_files(key, broken)
                 else:
-                    print(f"  帖子 {post_id} 缺少下载清单,执行快照重置...", flush=True)
+                    logger.info(
+                        "operation=reset_snapshot author=%s post=%s reason=missing_manifest",
+                        creator,
+                        post_id,
+                    )
                     database.reset_post(key)
 
             try:
@@ -623,16 +781,18 @@ class CreatorSync:
                     f"  帖子 {post_id} 下载修复失败",
                 )
             except CloudflareBlocked as exc:
-                print(f"  {exc}")
-                return False, downloaded_file_count
+                return "cloudflare_aborted", downloaded_file_count
             except RetryExhausted as exc:
-                print(f"  {exc}")
                 if exc.skips_author:
                     raise
+                partial = True
                 continue
             if result is not None:
                 downloaded_file_count += result.downloaded_file_count
-        return True, downloaded_file_count
+                partial = partial or result.status is None
+            else:
+                partial = True
+        return ("partial" if partial else "complete"), downloaded_file_count
 
     @staticmethod
     def _retry_after(value):
@@ -649,19 +809,78 @@ class CreatorSync:
             except (TypeError, ValueError, OverflowError):
                 return None
 
-    def _retry(self, operation, *, scope: RetryScope, operation_name):
+    def _retry(
+        self,
+        operation,
+        *,
+        scope: RetryScope,
+        operation_name,
+        creator_id=None,
+        post_id=None,
+        file_path=None,
+    ):
         """Run one remote operation with the shared ordinary-failure policy."""
         last_error = None
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempt = 1
+        while attempt <= MAX_ATTEMPTS:
             try:
                 result = operation()
-            except CloudflareBlocked:
+            except CloudflareBlocked as exc:
+                self._cloudflare_streak += 1
+                self._cloudflare_blocks += 1
+                if self._cloudflare_streak >= MAX_CONSECUTIVE_CLOUDFLARE:
+                    logger.error(
+                        "operation=%s author=%s post=%s file=%s category=cloudflare "
+                        "attempt=%s/%s wait=none escalation=abort_run error=%s",
+                        operation_name,
+                        creator_id,
+                        post_id,
+                        file_path,
+                        self._cloudflare_streak,
+                        MAX_CONSECUTIVE_CLOUDFLARE,
+                        exc,
+                    )
+                    raise
+                wait = CLOUDFLARE_WAITS[self._cloudflare_streak - 1]
+                logger.warning(
+                    "operation=%s author=%s post=%s file=%s category=cloudflare "
+                    "attempt=%s/%s wait=%ss escalation=retry error=%s",
+                    operation_name,
+                    creator_id,
+                    post_id,
+                    file_path,
+                    self._cloudflare_streak,
+                    MAX_CONSECUTIVE_CLOUDFLARE,
+                    wait,
+                    exc,
+                )
+                wait_with_progress(wait, self.sleep_fn)
+            except AuthenticationError as exc:
+                self._cloudflare_streak = 0
+                exc.operation = operation_name
+                exc.creator_id = creator_id
+                exc.post_id = post_id
+                exc.file_path = file_path
                 raise
             except (sqlite3.Error, StateDatabaseError):
+                self._cloudflare_streak = 0
                 raise
             except RetryableFanboxError as exc:
+                self._cloudflare_streak = 0
                 last_error = exc
                 if attempt >= MAX_ATTEMPTS:
+                    logger.error(
+                        "operation=%s author=%s post=%s file=%s category=retryable "
+                        "attempt=%s/%s wait=none escalation=skip_%s error=%s",
+                        operation_name,
+                        creator_id,
+                        post_id,
+                        file_path,
+                        attempt,
+                        MAX_ATTEMPTS,
+                        scope.value,
+                        exc,
+                    )
                     raise RetryExhausted(
                         scope, operation_name, MAX_ATTEMPTS, exc
                     ) from exc
@@ -669,35 +888,45 @@ class CreatorSync:
                     getattr(exc, "retry_after", None)
                 )
                 wait = retry_after if retry_after is not None else RETRY_WAITS[attempt - 1]
-                print(
-                    f"  {operation_name} failed ({attempt}/{MAX_ATTEMPTS}): "
-                    f"{exc}; retrying in {wait:g}s",
-                    flush=True,
+                logger.warning(
+                    "operation=%s author=%s post=%s file=%s category=retryable "
+                    "attempt=%s/%s wait=%ss escalation=retry error=%s",
+                    operation_name,
+                    creator_id,
+                    post_id,
+                    file_path,
+                    attempt,
+                    MAX_ATTEMPTS,
+                    f"{wait:g}",
+                    exc,
                 )
                 self.sleep_fn(wait)
+                attempt += 1
+            except Exception:
+                self._cloudflare_streak = 0
+                raise
             else:
+                self._cloudflare_streak = 0
                 if self.api_delay:
                     self.sleep_fn(self.api_delay)
                 return result
         raise RetryExhausted(scope, operation_name, MAX_ATTEMPTS, last_error)
 
-    def _metadata(self, operation):
-        for attempt in range(1, len(CLOUDFLARE_WAITS) + 2):
-            try:
-                return self._retry(
-                    operation,
-                    scope=RetryScope.AUTHOR,
-                    operation_name="metadata",
-                )
-            except CloudflareBlocked:
-                if attempt > len(CLOUDFLARE_WAITS):
-                    raise
-                wait = CLOUDFLARE_WAITS[attempt - 1]
-                print(
-                    f"  Cloudflare temporary block; retrying in {wait}s",
-                    flush=True,
-                )
-                wait_with_progress(wait, self.sleep_fn)
+    def _metadata(
+        self,
+        operation,
+        *,
+        operation_name,
+        creator_id,
+        post_id=None,
+    ):
+        return self._retry(
+            operation,
+            scope=RetryScope.AUTHOR,
+            operation_name=operation_name,
+            creator_id=creator_id,
+            post_id=post_id,
+        )
 
     def _process_post(self, database, key, post):
         post_id = str(post["id"])
@@ -714,9 +943,18 @@ class CreatorSync:
             title = str(post.get("title") or post_id)
             return _PostResult("restricted", 0, title, None)
 
-        title, files = self._metadata(lambda: self.fanbox.post_detail(post_id))
+        title, files = self._metadata(
+            lambda: self.fanbox.post_detail(post_id),
+            operation_name="post_detail",
+            creator_id=key.creator_id,
+            post_id=post_id,
+        )
         if not files:
-            print("无文件,跳过")
+            logger.info(
+                "operation=process_post author=%s post=%s outcome=empty",
+                key.creator_id,
+                post_id,
+            )
             return _PostResult("empty", 0, title, None)
 
         directory_path = _post_directory(self.root, key.creator_id, post_id, title)
@@ -747,7 +985,16 @@ class CreatorSync:
     def _download_manifest(
         self, database, key, title, directory_path
     ):
-        os.makedirs(directory_path, exist_ok=True)
+        try:
+            os.makedirs(directory_path, exist_ok=True)
+        except OSError as exc:
+            raise LocalPersistenceError(
+                "create_directory",
+                exc,
+                creator_id=key.creator_id,
+                post_id=key.post_id,
+                file_path=directory_path,
+            ) from exc
         downloaded_file_count = 0
         failed = False
 
@@ -763,36 +1010,74 @@ class CreatorSync:
                 actual_size = self._retry(
                     lambda: self._download_file_attempt(file, part_path),
                     scope=RetryScope.FILE,
-                    operation_name=f"download_file:{file.resource_url}",
+                    operation_name="download_file",
+                    creator_id=key.creator_id,
+                    post_id=key.post_id,
+                    file_path=final_path,
                 )
 
                 database.stage_file(
                     key, file.position, actual_size
                 )
-                os.replace(part_path, final_path)
+                try:
+                    os.replace(part_path, final_path)
+                except OSError as exc:
+                    raise LocalPersistenceError(
+                        "atomic_rename",
+                        exc,
+                        creator_id=key.creator_id,
+                        post_id=key.post_id,
+                        file_path=final_path,
+                    ) from exc
                 database.complete_file(key, file.position)
                 downloaded_file_count += 1
             except sqlite3.Error:
                 raise
+            except (AuthenticationError, LocalPersistenceError):
+                raise
+            except OSError as exc:
+                raise LocalPersistenceError(
+                    "write_file",
+                    exc,
+                    creator_id=key.creator_id,
+                    post_id=key.post_id,
+                    file_path=final_path,
+                ) from exc
             except CloudflareBlocked:
                 raise
             except RetryExhausted:
                 raise
             except Exception as exc:
                 failed = True
-                print(f"\n  下载 {file.resource_url} 失败: {exc}")
+                logger.error(
+                    "operation=download_file author=%s post=%s file=%s "
+                    "category=permanent_remote attempt=1/1 wait=none "
+                    "escalation=skip_post error=%s",
+                    key.creator_id,
+                    key.post_id,
+                    final_path,
+                    exc,
+                )
             finally:
                 self.sleep_fn(self.file_delay)
 
         if failed or not database.all_files_complete(key):
-            print(f"未完成 -> {directory_path}")
+            logger.warning(
+                "operation=process_post author=%s post=%s outcome=partial directory=%s",
+                key.creator_id,
+                key.post_id,
+                directory_path,
+            )
             return _PostResult(
                 None, downloaded_file_count, title, directory_path
             )
 
-        print(
-            f"完成({len(database.manifest_files(key))} 个文件)"
-            f" -> {directory_path}"
+        logger.info(
+            "operation=process_post author=%s post=%s outcome=complete files=%s directory=%s",
+            key.creator_id,
+            key.post_id,
+            len(database.manifest_files(key)),
+            directory_path,
         )
         return _PostResult(
             "downloaded", downloaded_file_count, title, directory_path
@@ -814,7 +1099,16 @@ class CreatorSync:
         if file.phase == "staged" and _file_has_size(
             part_path, file.expected_size
         ):
-            os.replace(part_path, final_path)
+            try:
+                os.replace(part_path, final_path)
+            except OSError as exc:
+                raise LocalPersistenceError(
+                    "atomic_rename",
+                    exc,
+                    creator_id=key.creator_id,
+                    post_id=key.post_id,
+                    file_path=final_path,
+                ) from exc
             database.complete_file(key, file.position)
             return True
 
