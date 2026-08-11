@@ -1,4 +1,5 @@
 import os
+import signal
 import shutil
 import sqlite3
 import tempfile
@@ -214,6 +215,26 @@ class SchedulerTests(unittest.TestCase):
         run_scheduler(config, sync=Sync(), sleep_fn=lambda _: self.fail("should not wait"))
 
         self.assertEqual(calls, ["run"])
+
+    def test_shutdown_during_sync_exits_before_sync_can_continue(self):
+        calls = []
+        config = read_config({
+            "FANBOX_COOKIE": "cookie",
+            "FANBOX_CREATORS": "creator",
+            "FANBOX_RUN_ON_START": "true",
+        })
+
+        class Sync:
+            def run(self):
+                calls.append("before shutdown")
+                fanbox_dl.handle_shutdown(signal.SIGTERM, None)
+                calls.append("after shutdown")
+
+        with self.assertRaises(SystemExit) as stopped:
+            run_scheduler(config, sync=Sync())
+
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(calls, ["before shutdown"])
 
     def test_startup_run_false_waits_for_schedule(self):
         calls = []

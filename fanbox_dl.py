@@ -426,6 +426,7 @@ def handle_shutdown(signum, _frame):
     _shutdown_requested = True
     logger.info("收到信号 %s，正在停止调度", signum)
     close_browser()
+    raise SystemExit(0)
 
 
 def main():
